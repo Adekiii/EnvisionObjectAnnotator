@@ -1,11 +1,14 @@
-extra/
 *.pt
 .DS_Store
 sam2/
 EdgeTAM/
 /.venv/
 backend/.venv/
+backend/vendor/
+backend/checkpoints/
+backend/sessions/
 frontend/node_modules/
+frontend/dist/
 backend/data/
 __pycache__/
 *.pyc

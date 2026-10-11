@@ -5,7 +5,6 @@ import threading
 import torch
 import traceback
 import os
-import re
 import cv2
 import numpy as np
 import time
@@ -35,187 +34,91 @@ REPO_DIR = BASE_DIR.parent
 SESSIONS_DIR = BASE_DIR / "data" / "sessions"
 
 
-MODEL_CATALOG = [
-    {
-        "key": "sam2.1_hiera_l",
-        "label": "SAM2.1 Large (hiera_l)",
-        "checkpoint": REPO_DIR / "checkpoints" / "sam2.1_hiera_large.pt",
-        "config": "configs/sam2.1/sam2.1_hiera_l.yaml",
-    },
-    {
-        "key": "sam2.1_hiera_b+",
-        "label": "SAM2.1 Base+ (hiera_b+)",
-        "checkpoint": REPO_DIR / "checkpoints" / "sam2.1_hiera_base_plus.pt",
-        "config": "configs/sam2.1/sam2.1_hiera_b+.yaml",
-    },
-    {
-        "key": "sam2.1_hiera_s",
-        "label": "SAM2.1 Small (hiera_s)",
-        "checkpoint": REPO_DIR / "checkpoints" / "sam2.1_hiera_small.pt",
-        "config": "configs/sam2.1/sam2.1_hiera_s.yaml",
-    },
-    {
-        "key": "sam2.1_hiera_t",
-        "label": "SAM2.1 Tiny (hiera_t)",
-        "checkpoint": REPO_DIR / "checkpoints" / "sam2.1_hiera_tiny.pt",
-        "config": "configs/sam2.1/sam2.1_hiera_t.yaml",
-    },
-    {
-        "key": "edgetam",
-        "label": "EdgeTAM (edgetam)",
-        "checkpoint": REPO_DIR / "EdgeTAM" / "checkpoints" / "edgetam.pt",
-        "config": "configs/edgetam.yaml",
-    },
-]
+MOBILESAM_CHECKPOINT = BASE_DIR / "checkpoints" / "mobile_sam.pt"
+MODEL_LABEL = "MobileSAM + Cutie"
 
-DEFAULT_MODEL_KEY = "sam2.1_hiera_b+"
-
-_IMAGE_PREDICTOR_CACHE = {}
-_VIDEO_PREDICTOR_CACHE = None  # (cache_key, predictor, device) or None
+_CUTIE_CACHE = None  # (cutie_model, device) or None
+_MOBILESAM_CACHE = None  # (predictor, device) or None
+_CUTIE_LOAD_LOCK = threading.Lock()
+_MOBILESAM_LOCK = threading.Lock()
 
 
 def list_available_models():
-    models = []
-    for item in MODEL_CATALOG:
-        config_path = item.get("config")
-        config_ok = config_path.exists() if isinstance(config_path, Path) else True
-        models.append(
-            {
-                "key": item["key"],
-                "label": item["label"],
-                "available": item["checkpoint"].exists() and config_ok,
-            }
-        )
-    return models
+    return [
+        {
+            "key": "mobilesam_cutie",
+            "label": MODEL_LABEL,
+            "available": MOBILESAM_CHECKPOINT.exists(),
+        }
+    ]
 
 
 def _evict_video_predictor_cache():
-    """Free the cached video predictor to reclaim GPU memory."""
-    global _VIDEO_PREDICTOR_CACHE
-    if _VIDEO_PREDICTOR_CACHE is not None:
-        log.info("evicting cached video predictor")
-        try:
-            del _VIDEO_PREDICTOR_CACHE
-        except Exception:
-            pass
-        _VIDEO_PREDICTOR_CACHE = None
+    """Run GPU memory cleanup WITHOUT dropping the cached Cutie model."""
     ultra_cleanup_memory()
 
 
 def _evict_image_predictor_cache():
-    """Free all cached image predictors to reclaim GPU memory."""
-    global _IMAGE_PREDICTOR_CACHE
-    if not _IMAGE_PREDICTOR_CACHE:
-        return
-    log.info("evicting %d cached image predictor(s)", len(_IMAGE_PREDICTOR_CACHE))
-    for _, (predictor, _) in list(_IMAGE_PREDICTOR_CACHE.items()):
-        try:
-            if hasattr(predictor, "model"):
-                del predictor.model
-            del predictor
-        except Exception:
-            pass
-    _IMAGE_PREDICTOR_CACHE.clear()
+    """Free the cached MobileSAM predictor to reclaim GPU memory."""
+    global _MOBILESAM_CACHE
+    if _MOBILESAM_CACHE is not None:
+        log.info("evicting cached MobileSAM predictor")
+        _MOBILESAM_CACHE = None
     ultra_cleanup_memory()
 
 
-def _resolve_model_config(model_key=None):
-    entry = _select_model_entry(model_key)
-    return str(entry["config"]), entry["checkpoint"]
+def _get_cutie_model(use_cache=True):
+    """Load (and cache) Cutie's model weights. A fresh InferenceCore is
+    built from this per propagation pass inside pipeline.py."""
+    global _CUTIE_CACHE
+    if use_cache and _CUTIE_CACHE is not None:
+        log.debug("Cutie model cache hit")
+        return _CUTIE_CACHE
+
+    with _CUTIE_LOAD_LOCK:
+        if use_cache and _CUTIE_CACHE is not None:  # re-check: lost the race to load
+            return _CUTIE_CACHE
+
+        log.info("loading Cutie model")
+        from cutie.utils.get_default_model import get_default_model
+
+        configure_torch_ultra_conservative()
+        device = setup_device_ultra_optimized()
+        cutie_model = get_default_model()
+
+        cutie_model.cfg.use_long_term = True
+        log.info(
+            "Cutie long-term memory enabled (max_mem_frames=%s, num_prototypes=%s)",
+            cutie_model.cfg.long_term.max_mem_frames,
+            cutie_model.cfg.long_term.num_prototypes,
+        )
+
+        if use_cache:
+            _CUTIE_CACHE = (cutie_model, device)
+        return cutie_model, device
 
 
-def _select_model_entry(model_key=None):
-    if model_key and model_key != "auto":
-        for item in MODEL_CATALOG:
-            if item["key"] == model_key:
-                if not item["checkpoint"].exists():
-                    raise FileNotFoundError(f"Checkpoint missing for model {model_key}")
-                config_path = item.get("config")
-                if config_path and isinstance(config_path, Path) and not config_path.exists():
-                    raise FileNotFoundError(f"Config missing for model {model_key}")
-                return item
-        raise ValueError(f"Unknown model key: {model_key}")
+def _ensure_sam_predictor(use_mps=False):
+    """Load (and cache) the MobileSAM predictor used for click-to-mask."""
+    global _MOBILESAM_CACHE
+    if _MOBILESAM_CACHE is not None:
+        return _MOBILESAM_CACHE
 
-    # Try the recommended default model first
-    for item in MODEL_CATALOG:
-        if item["key"] == DEFAULT_MODEL_KEY:
-            config_path = item.get("config")
-            config_ok = config_path.exists() if isinstance(config_path, Path) else True
-            if item["checkpoint"].exists() and config_ok:
-                return item
-            break
+    if not MOBILESAM_CHECKPOINT.exists():
+        raise FileNotFoundError(f"MobileSAM checkpoint missing: {MOBILESAM_CHECKPOINT}")
 
-    # Fall back to first available model
-    for item in MODEL_CATALOG:
-        config_path = item.get("config")
-        config_ok = config_path.exists() if isinstance(config_path, Path) else True
-        if item["checkpoint"].exists() and config_ok:
-            return item
-    raise FileNotFoundError("SAM2 checkpoints not found")
+    log.info("loading MobileSAM predictor")
+    from mobile_sam import SamPredictor, sam_model_registry
 
-
-def _build_predictor(use_mps=False, model_key=None, use_cache=True):
-    global _VIDEO_PREDICTOR_CACHE
-    cache_key = (model_key or "auto", bool(use_mps))
-
-    if use_cache and _VIDEO_PREDICTOR_CACHE is not None:
-        cached_key, predictor, device = _VIDEO_PREDICTOR_CACHE
-        if cached_key == cache_key:
-            log.debug("video predictor cache hit: %s", cache_key)
-            return predictor, device
-        # Different model requested — evict the old one
-        _evict_video_predictor_cache()
-
-    log.info("building video predictor: model_key=%s use_mps=%s", model_key, use_mps)
-    from sam2.build_sam import build_sam2_video_predictor
-
-    configure_torch_ultra_conservative()
-    torch.set_default_dtype(torch.float32)
     device = setup_device_ultra_optimized()
     if device.type == "mps" and not use_mps:
         device = torch.device("cpu")
 
-    entry = _select_model_entry(model_key=model_key)
-    model_cfg, checkpoint = str(entry["config"]), entry["checkpoint"]
-    predictor = build_sam2_video_predictor(model_cfg, str(checkpoint), device=device)
-    if hasattr(predictor, "model"):
-        try:
-            predictor.model = predictor.model.to(device=device, dtype=torch.float32)
-        except Exception:
-            pass
-
-    if use_cache:
-        _VIDEO_PREDICTOR_CACHE = (cache_key, predictor, device)
-        log.info("video predictor cached on %s", device)
-
-    return predictor, device
-
-
-def _build_image_predictor(use_mps=False, model_key=None):
-    cache_key = (model_key or "auto", bool(use_mps))
-    cached = _IMAGE_PREDICTOR_CACHE.get(cache_key)
-    if cached:
-        return cached
-
-    from sam2.build_sam import build_sam2
-    from sam2.sam2_image_predictor import SAM2ImagePredictor
-
-    configure_torch_ultra_conservative()
-    torch.set_default_dtype(torch.float32)
-    device = setup_device_ultra_optimized()
-    if device.type == "mps" and not use_mps:
-        device = torch.device("cpu")
-
-    entry = _select_model_entry(model_key=model_key)
-    model_cfg, checkpoint = str(entry["config"]), entry["checkpoint"]
-    sam_model = build_sam2(model_cfg, str(checkpoint), device=device)
-    try:
-        sam_model = sam_model.to(device=device, dtype=torch.float32)
-    except Exception:
-        pass
-
-    predictor = SAM2ImagePredictor(sam_model)
-    _IMAGE_PREDICTOR_CACHE[cache_key] = (predictor, device)
+    sam = sam_model_registry["vit_t"](checkpoint=str(MOBILESAM_CHECKPOINT))
+    sam.to(device=device)
+    sam.eval()
+    predictor = SamPredictor(sam)
+    _MOBILESAM_CACHE = (predictor, device)
     return predictor, device
 
 
@@ -230,168 +133,16 @@ def _get_ram_info():
     }
 
 
-def _clamp(value, min_value, max_value):
-    return max(min_value, min(value, max_value))
-
-
-def _auto_tune_settings(frame_count, predictor, config, log_cb=None, fps=None):
-    target = float(config.get("tuning_target", 0.75) or 0.75)
-    target = _clamp(target, 0.5, 0.9)
-    reserve_gb = float(config.get("tuning_reserve_gb", 8.0) or 0.0)
-    reserve_gb = max(0.0, reserve_gb)
-    max_cache_override = config.get("max_cache_frames")
-    max_cache_cap = config.get("max_cache_cap")
-    preview_stride_override = config.get("preview_stride")
-    chunk_size = config.get("chunk_size")
-    chunk_seconds = config.get("chunk_seconds")
-    chunk_overlap = config.get("chunk_overlap", 1)
-    compress_masks = config.get("compress_masks")
-
-    cpu_pct = None
-    if psutil is not None:
-        try:
-            cpu_pct = psutil.cpu_percent(interval=0.1)
-        except Exception:
-            cpu_pct = None
-
-    ram_info = _get_ram_info()
-    gpu_info = get_gpu_memory_info()
-
-    image_size = getattr(predictor, "image_size", 1024)
-    bytes_per_frame = int(image_size) * int(image_size) * 3 * 4
-    estimated_video_gb = (bytes_per_frame * frame_count) / 1024**3 if frame_count else 0.0
-
-    max_cache_frames = None
-    if max_cache_override is not None:
-        try:
-            max_cache_frames = int(max_cache_override)
-        except (TypeError, ValueError):
-            max_cache_frames = None
-    elif ram_info is not None and bytes_per_frame > 0:
-        available_gb = max(0.0, ram_info["available_gb"] - reserve_gb)
-        target_bytes = available_gb * 1024**3 * target
-        max_cache_frames = int(target_bytes // bytes_per_frame)
-
-    if max_cache_cap is None and frame_count >= 5000:
-        max_cache_cap = 2048
-    if max_cache_cap is not None:
-        try:
-            max_cache_cap = int(max_cache_cap)
-        except (TypeError, ValueError):
-            max_cache_cap = None
-    if max_cache_cap is not None:
-        if max_cache_frames is None:
-            max_cache_frames = max_cache_cap
-        else:
-            max_cache_frames = min(max_cache_frames, max_cache_cap)
-
-    if max_cache_frames is not None:
-        if max_cache_frames >= frame_count:
-            max_cache_frames = None
-        else:
-            max_cache_frames = max(2, max_cache_frames)
-
-    if chunk_seconds is not None:
-        try:
-            chunk_seconds = float(chunk_seconds)
-        except (TypeError, ValueError):
-            chunk_seconds = None
-    if chunk_seconds and fps and fps > 0:
-        chunk_size = max(1, int(round(fps * chunk_seconds)))
-    if chunk_size is None and frame_count >= 5000:
-        chunk_size = 1000
-    if chunk_size is not None:
-        try:
-            chunk_size = int(chunk_size)
-        except (TypeError, ValueError):
-            chunk_size = None
-    if chunk_overlap is None:
-        chunk_overlap = 1
-    try:
-        chunk_overlap = max(1, int(chunk_overlap))
-    except (TypeError, ValueError):
-        chunk_overlap = 1
-
-    if compress_masks is None:
-        compress_masks = frame_count >= 2000
-
-    if preview_stride_override is not None:
-        try:
-            preview_stride = max(1, int(preview_stride_override))
-        except (TypeError, ValueError):
-            preview_stride = 1
-    else:
-        # Reduced from 600 to 200 to lower overhead - updates every ~8-9 frames for typical videos
-        target_previews = 200
-        preview_stride = max(1, int(frame_count / target_previews)) if frame_count else 1
-
-    gpu_memory_fraction = None
-    if torch.cuda.is_available():
-        gpu_memory_fraction = _clamp(target, 0.4, 0.95)
-
-    if log_cb:
-        log_cb(
-            "auto_tune: target=%.2f reserve_gb=%.1f cpu_pct=%s ram_avail_gb=%s gpu_free_gb=%s "
-            "bytes_per_frame=%s est_video_gb=%.2f max_cache_frames=%s max_cache_cap=%s "
-            "chunk_size=%s chunk_seconds=%s chunk_overlap=%s compress_masks=%s preview_stride=%s "
-            "gpu_mem_fraction=%s"
-            % (
-                target,
-                reserve_gb,
-                cpu_pct if cpu_pct is not None else "n/a",
-                ram_info["available_gb"] if ram_info else "n/a",
-                gpu_info["free_gb"] if gpu_info else "n/a",
-                bytes_per_frame,
-                estimated_video_gb,
-                max_cache_frames if max_cache_frames is not None else "full",
-                max_cache_cap if max_cache_cap is not None else "n/a",
-                chunk_size if chunk_size is not None else "off",
-                chunk_seconds if chunk_seconds is not None else "n/a",
-                chunk_overlap,
-                compress_masks,
-                preview_stride,
-                gpu_memory_fraction if gpu_memory_fraction is not None else "n/a",
-            )
-        )
-
-    return {
-        "target": target,
-        "reserve_gb": reserve_gb,
-        "cpu_pct": cpu_pct,
-        "ram_info": ram_info,
-        "gpu_info": gpu_info,
-        "bytes_per_frame": bytes_per_frame,
-        "estimated_video_gb": estimated_video_gb,
-        "max_cache_frames": max_cache_frames,
-        "max_cache_cap": max_cache_cap,
-        "chunk_size": chunk_size,
-        "chunk_seconds": chunk_seconds,
-        "chunk_overlap": chunk_overlap,
-        "compress_masks": compress_masks,
-        "preview_stride": preview_stride,
-        "gpu_memory_fraction": gpu_memory_fraction,
-    }
-
-
 def test_mask_preview(session_id, frame_index, object_name, points, bbox=None):
-    """Generate a mask preview using video predictor on a single frame (fast)."""
-    import tempfile
-    import shutil
-
+    """Compute a live mask preview for one frame via MobileSAM."""
     slog = get_session_logger(session_id)
-    slog.info("test_mask_preview: frame=%d obj=%s pts=%d bbox=%s", frame_index, object_name, len(points), bbox is not None)
-    session = state.get_session(session_id)
+    slog.info("test_mask_preview: frame=%d obj=%s pts=%d", frame_index, object_name, len(points))
     frames_dir = SESSIONS_DIR / session_id / "frames"
     if not frames_dir.exists():
         raise FileNotFoundError("Frames not found")
 
-    use_mps = bool((session.config or {}).get("use_mps", False))
-    model_key = (session.config or {}).get("model_key") or "auto"
-
-    # Build coordinate arrays
     coords_list = [[float(p["x"]), float(p["y"])] for p in points]
     labels_list = [int(p["label"]) for p in points]
-
     if len(coords_list) == 0:
         raise ValueError("No points provided")
 
@@ -400,76 +151,31 @@ def test_mask_preview(session_id, frame_index, object_name, points, bbox=None):
     if frame is None:
         raise FileNotFoundError("Frame not found")
 
-    # Create a temp directory with just the one frame for fast loading
-    temp_dir = tempfile.mkdtemp(prefix="sam2_test_")
-    try:
-        # Copy single frame to temp dir as 00000.jpg (video predictor expects this format)
-        temp_frame_path = Path(temp_dir) / "00000.jpg"
-        enhance_target = bool((session.config or {}).get("enhance_target", False))
-        if enhance_target:
-            enhanced = UltraOptimizedProcessor._enhance_red_channel(frame)
-            cv2.imwrite(str(temp_frame_path), enhanced)
-        else:
-            shutil.copy2(frame_path, temp_frame_path)
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    coords = np.array(coords_list, dtype=np.float32)
+    labels = np.array(labels_list, dtype=np.int32)
+    multimask = len(coords_list) == 1
 
-        predictor, device = _build_predictor(use_mps=use_mps, model_key=model_key)
+    with _MOBILESAM_LOCK:
+        predictor, _device = _ensure_sam_predictor()
+        predictor.set_image(rgb)
+        masks, scores, _ = predictor.predict(point_coords=coords, point_labels=labels, multimask_output=multimask)
+    best = int(np.argmax(scores))
+    mask = masks[best].astype(bool)
 
-        with torch.inference_mode():
-            # Initialize state with temp directory (only 1 frame)
-            inference_state = predictor.init_state(
-                video_path=temp_dir,
-                offload_video_to_cpu=True,
-                offload_state_to_cpu=True,
-                async_loading_frames=False,
-            )
+    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    polygons = [c.reshape(-1, 2).tolist() for c in contours if len(c) >= 3]
+    h, w = mask.shape
 
-            # Add points for the object (frame_idx=0 since it's the only frame)
-            points_arr = np.array(coords_list, dtype=np.float32)
-            labels_arr = np.array(labels_list, dtype=np.int32)
+    return {
+        "polygons": polygons,
+        "width": w,
+        "height": h,
+        "area_px": int(mask.sum()),
+        "score": float(scores[best]),
+    }
 
-            sam_kwargs = dict(
-                inference_state=inference_state,
-                frame_idx=0,  # Always 0 since temp dir has only 1 frame
-                obj_id=1,
-                points=points_arr,
-                labels=labels_arr,
-            )
-            if bbox:
-                sam_kwargs["box"] = np.array(
-                    [bbox["x1"], bbox["y1"], bbox["x2"], bbox["y2"]], dtype=np.float32
-                )
-            _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(**sam_kwargs)
 
-            # Get the mask from the logits
-            mask_logits = out_mask_logits[0]  # First object
-            mask = (mask_logits > 0.0).squeeze().cpu().numpy()
-
-            # Clean up predictor state
-            predictor.reset_state(inference_state)
-    finally:
-        # Clean up temp directory
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-    # Resize mask if needed (video predictor may output different size)
-    if mask.shape != (frame.shape[0], frame.shape[1]):
-        mask = cv2.resize(mask.astype(np.uint8), (frame.shape[1], frame.shape[0])) > 0
-
-    mask = mask.astype(bool)
-
-    overlay = frame.copy()
-    color = np.array([34, 197, 94], dtype=np.uint8)
-    color_mask = np.zeros_like(overlay)
-    for c in range(3):
-        color_mask[:, :, c][mask] = color[c]
-    cv2.addWeighted(overlay, 0.5, color_mask, 0.5, 0, overlay)
-
-    preview_dir = SESSIONS_DIR / session_id / "previews"
-    preview_dir.mkdir(parents=True, exist_ok=True)
-    safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", object_name).strip("_") or "object"
-    preview_path = preview_dir / f"test_mask_{frame_index:05d}_{safe_name}.png"
-    cv2.imwrite(str(preview_path), overlay)
-
-    return preview_path
 
 
 class HeadlessProcessor:
@@ -495,7 +201,7 @@ class HeadlessProcessor:
             results,
             output_path,
             fps=fps,
-            show_original=True,
+            show_original=False,
             alpha=0.5,
             frame_limit=frame_limit,
             progress_callback=progress_callback,
@@ -708,10 +414,7 @@ def run_processing(session_id):
 
     config = session.config or {}
     overlap_threshold = float(config.get("overlap_threshold", 0.1))
-    batch_size = int(config.get("batch_size", 50))
-    auto_fallback = bool(config.get("auto_fallback", True))
-    auto_tune = bool(config.get("auto_tune", True))
-    auto_tune_info = None
+    auto_tune_info = None  # kept only so the profiling dict below has the key
     fps = None
     if "video_fps" in config:
         try:
@@ -729,22 +432,6 @@ def run_processing(session_id):
     export_elan = bool(config.get("export_elan", True))
     export_csv = bool(config.get("export_csv", True))
     reference_frame = int(config.get("reference_frame", 0))
-    frame_stride = config.get("frame_stride")
-    frame_interpolation = config.get("frame_interpolation")
-    roi_enabled = bool(config.get("roi_enabled", False))
-    enhance_target = bool(config.get("enhance_target", False))
-    try:
-        roi_margin = float(config.get("roi_margin", 0.15))
-    except (TypeError, ValueError):
-        roi_margin = 0.15
-    try:
-        roi_min_size = int(config.get("roi_min_size", 256))
-    except (TypeError, ValueError):
-        roi_min_size = 256
-    try:
-        roi_max_coverage = float(config.get("roi_max_coverage", 0.95))
-    except (TypeError, ValueError):
-        roi_max_coverage = 0.95
     process_start_frame = config.get("process_start_frame")
     process_end_frame = config.get("process_end_frame")
     try:
@@ -756,16 +443,15 @@ def run_processing(session_id):
     except (TypeError, ValueError):
         process_end_frame = None
     use_mps = bool(config.get("use_mps", False))
-    enable_bidirectional = bool(config.get("enable_bidirectional", False))
-    model_key = config.get("model_key") or "auto"
-    resolved_model_key = model_key
-    model_label = model_key
+    enable_bidirectional = bool(config.get("enable_bidirectional", True))
+    resolved_model_key = "mobilesam_cutie"
+    model_label = MODEL_LABEL
     frame_count = len(list(frames_dir.glob("*.jpg")))
     gpu_start = get_gpu_memory_info()
     ram_start = _get_ram_info()
     _log_debug(
-        "config: model_key=%s reference_frame=%s batch_size=%s frames=%s"
-        % (model_key, reference_frame, batch_size, frame_count)
+        "config: reference_frame=%s frames=%s bidirectional=%s"
+        % (reference_frame, frame_count, enable_bidirectional)
     )
 
     multiframe_data = None
@@ -811,70 +497,31 @@ def run_processing(session_id):
     annotations_done = time.perf_counter()
 
     try:
-        _set_status(session_id, "initializing", 0.1, "Loading SAM2 model")
+        _set_status(session_id, "initializing", 0.1, f"Loading {MODEL_LABEL}")
         os.environ["HYDRA_FULL_ERROR"] = "1"
 
-        import sam2.sam2_video_predictor  # noqa: F401
-
-        # Evict cached test-mask predictor to free GPU memory for full processing
-        _evict_video_predictor_cache()
-
-        try:
-            model_entry = _select_model_entry(model_key=model_key)
-            resolved_model_key = model_entry["key"]
-            model_label = model_entry["label"]
-        except Exception as exc:
-            _set_status(session_id, "error", 0.1, f"Model selection error: {exc}")
-            return
-
-        predictor, device = _build_predictor(use_mps=use_mps, model_key=model_entry["key"], use_cache=False)
-        _log_debug(
-            "model ready: key=%s label=%s device=%s checkpoint=%s"
-            % (resolved_model_key, model_label, device, model_entry["checkpoint"])
-        )
-
-        if auto_tune:
-            auto_tune_info = _auto_tune_settings(
-                frame_count=frame_count,
-                predictor=predictor,
-                config=config,
-                log_cb=_log_debug,
-                fps=fps,
-            )
-        preview_stride = auto_tune_info["preview_stride"] if auto_tune_info else 1
-        max_cache_frames = auto_tune_info["max_cache_frames"] if auto_tune_info else None
-        gpu_memory_fraction = auto_tune_info["gpu_memory_fraction"] if auto_tune_info else None
-        chunk_size = auto_tune_info["chunk_size"] if auto_tune_info else config.get("chunk_size")
-        chunk_overlap = auto_tune_info["chunk_overlap"] if auto_tune_info else config.get("chunk_overlap", 1)
-        compress_masks = auto_tune_info["compress_masks"] if auto_tune_info else config.get("compress_masks")
+        # Reuse the cached Cutie model rather than forcing a reload: its
+        # get_default_model() initializes hydra's process-wide global state,
+        # which cannot be safely re-initialized within the same process.
+        cutie_model, device = _get_cutie_model()
+        with _MOBILESAM_LOCK:
+            sam_predictor, _sam_device = _ensure_sam_predictor(use_mps=use_mps)
+        _log_debug("model ready: %s device=%s" % (MODEL_LABEL, device))
 
         processor = UltraOptimizedProcessor(
-            predictor,
+            cutie_model,
+            sam_predictor,
             str(frames_dir),
             overlap_threshold=overlap_threshold,
             reference_frame=reference_frame,
-            batch_size=batch_size,
-            auto_fallback=auto_fallback,
             preview_callback=_save_preview,
             log_callback=_log_debug,
-            preview_stride=preview_stride,
+            preview_stride=max(1, int(frame_count / 200)) if frame_count else 1,
             preview_max_dim=720,
-            max_cache_frames=max_cache_frames,
-            gpu_memory_fraction=gpu_memory_fraction,
-            frame_stride=frame_stride,
-            frame_interpolation=frame_interpolation,
-            roi_enabled=roi_enabled,
-            roi_margin=roi_margin,
-            roi_min_size=roi_min_size,
-            roi_max_coverage=roi_max_coverage,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            compress_masks=compress_masks,
             mask_store_dir=str(SESSIONS_DIR / session_id / "mask_cache"),
             process_start_frame=process_start_frame,
             process_end_frame=process_end_frame,
             enable_bidirectional=enable_bidirectional,
-            enhance_target=enhance_target,
         )
         wrapped = HeadlessProcessor(processor)
     except ImportError as exc:

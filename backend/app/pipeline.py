@@ -1,6 +1,7 @@
 import os
 import json
 import shutil
+import contextlib
 from pathlib import Path
 from datetime import datetime
 import traceback
@@ -17,11 +18,7 @@ except ImportError:  # pragma: no cover - optional dependency
     psutil = None
 
 
-os.environ.setdefault("SAM2_OFFLOAD_VIDEO_TO_CPU", "true")
-os.environ.setdefault("SAM2_OFFLOAD_STATE_TO_CPU", "true")
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-# Note: CUDA_LAUNCH_BLOCKING=1 was removed — it serializes all GPU operations
-# and causes severe underutilization. Only re-enable for debugging CUDA errors.
 
 RAM_PRESSURE_THRESHOLD = 80
 
@@ -110,47 +107,48 @@ def ultra_cleanup_memory():
 
 
 def configure_torch_ultra_conservative():
-    """Configure PyTorch for conservative memory usage."""
+    """Basic torch setup. Cutie/MobileSAM are both lightweight (a few hundred
+    MB of VRAM) compared to SAM2's video predictor, so the aggressive
+    per-process memory-fraction capping and forced autocast context that used
+    to live here aren't needed -- autocast is applied per-call instead, where
+    the actual propagation happens."""
     torch.set_default_dtype(torch.float32)
-    if torch.cuda.is_available():
-        torch.cuda.set_per_process_memory_fraction(0.70)
-        try:
-            torch.backends.cuda.enable_flash_sdp(True)
-        except Exception:
-            pass
-        torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
-        if torch.cuda.get_device_properties(0).major >= 8:
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-        ultra_cleanup_memory()
-        print(f"GPU Memory after setup: {get_gpu_memory_info()}")
+    if torch.cuda.is_available() and torch.cuda.get_device_properties(0).major >= 8:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
 
 def setup_device_ultra_optimized():
     """Setup computation device."""
     if torch.cuda.is_available():
         device = torch.device("cuda")
-        gpu_info = get_gpu_memory_info()
-        print(
-            f"Initial GPU Memory: {gpu_info['allocated_gb']:.1f}GB allocated, {gpu_info['free_gb']:.1f}GB free"
-        )
-        if gpu_info["total_gb"] < 8:
-            print("WARNING: Low GPU memory detected. Using conservative settings.")
-            torch.cuda.set_per_process_memory_fraction(0.60)
     elif torch.backends.mps.is_available():
         device = torch.device("mps")
-        print("Support for MPS devices is preliminary.")
         torch.set_default_dtype(torch.float32)
     else:
         device = torch.device("cpu")
-        print("Using CPU - this will be slow but stable")
 
     print(f"Using device: {device}")
     return device
 
 
 class DiskBackedMaskStore:
-    """Store masks on disk with a small in-memory cache."""
+    """Store masks on disk with a small in-memory cache.
+
+    Used to bound RAM on long videos instead of holding every frame's masks
+    in memory. This used to write one np.savez_compressed .npz file PER
+    OBJECT PER FRAME -- for a several-thousand-frame video with a handful of
+    objects and bidirectional propagation that's tens of thousands of
+    synchronous, zlib-compressed writes inside the main per-frame tracking
+    loop, which starves the GPU (observed ~15-20% utilization on an 8GB card
+    that should be much busier -- the compression, not the model, was the
+    bottleneck). A frame's object masks are mutually exclusive per pixel
+    anyway (Cutie's own output is a single label mask, not independent
+    per-object masks), so instead we combine them into one uint8 label
+    array (0 = background, else object id) and write ONE uncompressed .npy
+    per frame -- one fifth as many writes for a 4-object video, and no
+    compression overhead at all.
+    """
 
     def __init__(self, base_dir, max_in_memory=50):
         self.base_dir = Path(base_dir)
@@ -159,18 +157,43 @@ class DiskBackedMaskStore:
         self._in_memory = {}
         self._max_in_memory = max_in_memory
 
+    def _frame_path(self, frame_idx):
+        return self.base_dir / f"frame_{int(frame_idx):06d}.npy"
+
     def store(self, frame_idx, frame_results):
-        frame_dir = self.base_dir / f"frame_{int(frame_idx):06d}"
-        frame_dir.mkdir(exist_ok=True)
+        frame_idx = int(frame_idx)
         obj_ids = []
+        combined = None
+        claim_count = None
         for obj_id, mask in frame_results.items():
             if mask is None:
                 continue
-            mask_path = frame_dir / f"obj_{int(obj_id)}.npz"
-            np.savez_compressed(mask_path, mask=mask.astype(np.uint8))
-            obj_ids.append(int(obj_id))
-        self._index[int(frame_idx)] = obj_ids
-        self._in_memory[int(frame_idx)] = frame_results
+            obj_id = int(obj_id)
+            mask_bool = np.asarray(mask, dtype=bool)
+            if combined is None:
+                combined = np.zeros(mask_bool.shape, dtype=np.uint8)
+                claim_count = np.zeros(mask_bool.shape, dtype=np.uint8)
+            combined[mask_bool] = obj_id
+            claim_count[mask_bool] += 1
+            obj_ids.append(obj_id)
+        cleaned = {}
+        if combined is not None:
+            # Two of the incoming masks can legitimately disagree on a
+            # pixel (e.g. the forward and backward propagation passes
+            # merged at this frame) even though each is individually
+            # exclusive. Collapsing that to whichever object happened to be
+            # assigned last would silently bake one object's pixels into
+            # another's stored mask -- leave genuinely ambiguous pixels as
+            # background instead, same policy as the seed-mask overlap fix.
+            combined[claim_count > 1] = 0
+            np.save(self._frame_path(frame_idx), combined)
+            # Cache the SAME deduplicated view we just wrote, not the raw
+            # (possibly overlapping) input -- otherwise a load() that hits
+            # the in-memory cache would disagree with one that reads back
+            # from disk.
+            cleaned = {obj_id: combined == obj_id for obj_id in obj_ids}
+        self._index[frame_idx] = obj_ids
+        self._in_memory[frame_idx] = cleaned
         if len(self._in_memory) > self._max_in_memory:
             oldest = min(self._in_memory.keys())
             del self._in_memory[oldest]
@@ -183,15 +206,11 @@ class DiskBackedMaskStore:
         obj_ids = self._index.get(frame_idx)
         if not obj_ids:
             return {}
-        frame_dir = self.base_dir / f"frame_{frame_idx:06d}"
-        results = {}
-        for obj_id in obj_ids:
-            mask_path = frame_dir / f"obj_{obj_id}.npz"
-            if not mask_path.exists():
-                continue
-            with np.load(mask_path) as data:
-                results[obj_id] = data["mask"].astype(bool)
-        return results
+        path = self._frame_path(frame_idx)
+        if not path.exists():
+            return {}
+        combined = np.load(path)
+        return {obj_id: combined == obj_id for obj_id in obj_ids}
 
     def has_frame(self, frame_idx):
         return int(frame_idx) in self._index
@@ -535,59 +554,37 @@ class UltraOptimizedProcessor:
 
     def __init__(
         self,
-        predictor,
+        cutie_model,
+        sam_predictor,
         video_dir,
         overlap_threshold=0.1,
         reference_frame=0,
-        batch_size=50,
-        auto_fallback=True,
         preview_callback=None,
         log_callback=None,
         preview_stride=15,
         preview_max_dim=720,
-        max_cache_frames=None,
-        gpu_memory_fraction=None,
-        frame_stride=None,
-        frame_interpolation=None,
-        roi_enabled=False,
-        roi_margin=0.15,
-        roi_min_size=256,
-        roi_max_coverage=0.95,
-        chunk_size=None,
-        chunk_overlap=1,
-        compress_masks=None,
         process_start_frame=None,
         process_end_frame=None,
         mask_store_dir=None,
         disk_store_max_in_memory=50,
         ram_pressure_threshold=RAM_PRESSURE_THRESHOLD,
         disk_store_enabled=True,
-        enable_bidirectional=False,
-        enhance_target=False,
+        enable_bidirectional=True,
+        max_internal_size=480,
     ):
-        self.predictor = predictor
+        self.cutie_model = cutie_model
+        self.sam_predictor = sam_predictor
+        self.max_internal_size = max_internal_size
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.full_video_dir = video_dir
         self.video_dir = video_dir
         self.overlap_threshold = overlap_threshold
         self.reference_frame = reference_frame
         self.reference_frame_full = reference_frame
-        self.batch_size = batch_size
-        self.auto_fallback = auto_fallback
         self.preview_callback = preview_callback
         self.log_callback = log_callback
         self.preview_stride = max(1, int(preview_stride)) if preview_stride else None
         self.preview_max_dim = int(preview_max_dim)
-        self.max_cache_frames = max_cache_frames
-        self.gpu_memory_fraction = gpu_memory_fraction
-        self.frame_stride = frame_stride
-        self.frame_interpolation = frame_interpolation
-        self.roi_enabled = roi_enabled
-        self.roi_margin = roi_margin
-        self.roi_min_size = roi_min_size
-        self.roi_max_coverage = roi_max_coverage
-        self.chunk_size = chunk_size
-        self.chunk_overlap = chunk_overlap
-        self.compress_masks = compress_masks
         self.process_start_frame_full = process_start_frame
         self.process_end_frame_full = process_end_frame
         self.process_start_frame = None
@@ -597,11 +594,10 @@ class UltraOptimizedProcessor:
         self.ram_pressure_threshold = ram_pressure_threshold
         self.disk_store_enabled = disk_store_enabled
         self.enable_bidirectional = enable_bidirectional
-        self.enhance_target = enhance_target
         self._mask_store = None
         self._disk_store_active = False
         self.frame_index_map = None
-        self.roi_info = None
+        self.roi_info = None  # kept only so downstream export code's getattr(self, "roi_info", None) no-ops
         self._prepared = False
 
         self.overlap_tracker = ImprovedTargetOverlapTracker(overlap_threshold)
@@ -635,12 +631,10 @@ class UltraOptimizedProcessor:
                 (0, 128, 128),
                 (200, 200, 200),
             ]
-        self.offload_video_to_cpu = os.environ.get("SAM2_OFFLOAD_VIDEO_TO_CPU", "true") == "true"
-        self.offload_state_to_cpu = os.environ.get("SAM2_OFFLOAD_STATE_TO_CPU", "true") == "true"
 
     def _compress_mask(self, mask):
-        if not self.compress_masks:
-            return mask
+        if mask is None:
+            return None
         if mask is None:
             return None
         if isinstance(mask, dict) and mask.get("_packed"):
@@ -760,12 +754,7 @@ class UltraOptimizedProcessor:
             self._mask_store.store(frame_idx, frame_results)
             results[frame_idx] = {"_disk_only": True}
             return
-        if self.compress_masks:
-            results[frame_idx] = {
-                obj_id: self._compress_mask(mask) for obj_id, mask in frame_results.items()
-            }
-        else:
-            results[frame_idx] = frame_results
+        results[frame_idx] = frame_results
 
     def _get_frame_results(self, results, frame_idx):
         frame_results = results.get(frame_idx)
@@ -777,1129 +766,220 @@ class UltraOptimizedProcessor:
     def get_partial_results(self):
         return self.partial_results or {}
 
-    def _list_frame_files(self, video_dir):
-        return sorted(
-            [
-                p
-                for p in os.listdir(video_dir)
-                if os.path.splitext(p)[-1].lower() in [".jpg", ".jpeg"]
-            ],
-            key=lambda p: int(os.path.splitext(p)[0]),
-        )
-
-    def _map_frame_idx(self, local_idx):
-        if not self.frame_index_map:
-            return local_idx
-        if 0 <= local_idx < len(self.frame_index_map):
-            return self.frame_index_map[local_idx]
-        return local_idx
-
-    def _map_full_range_to_local(self, full_start, full_end):
-        if not self.frame_index_map:
-            return full_start, full_end
-        local_start = None
-        local_end = None
-        for idx, full_idx in enumerate(self.frame_index_map):
-            if local_start is None and full_idx >= full_start:
-                local_start = idx
-            if full_idx <= full_end:
-                local_end = idx
-        return local_start, local_end
-
-    def _compute_roi_box(self, points_dict, frame_width, frame_height):
-        if not self.roi_enabled:
-            return None
-        all_points = []
-        for points in points_dict.values():
-            for pt in points:
-                if pt and len(pt) >= 2:
-                    all_points.append(pt)
-        if not all_points:
-            return None
-
-        xs = [p[0] for p in all_points]
-        ys = [p[1] for p in all_points]
-        min_x = max(0, int(min(xs)))
-        max_x = min(frame_width - 1, int(max(xs)))
-        min_y = max(0, int(min(ys)))
-        max_y = min(frame_height - 1, int(max(ys)))
-        if max_x <= min_x or max_y <= min_y:
-            return None
-
-        box_w = max(1, max_x - min_x + 1)
-        box_h = max(1, max_y - min_y + 1)
-        pad_x = int(box_w * float(self.roi_margin))
-        pad_y = int(box_h * float(self.roi_margin))
-
-        x0 = max(0, min_x - pad_x)
-        y0 = max(0, min_y - pad_y)
-        x1 = min(frame_width - 1, max_x + pad_x)
-        y1 = min(frame_height - 1, max_y + pad_y)
-
-        roi_w = x1 - x0 + 1
-        roi_h = y1 - y0 + 1
-        min_size = int(self.roi_min_size) if self.roi_min_size else 0
-        if min_size > 0:
-            if roi_w < min_size:
-                extra = min_size - roi_w
-                x0 = max(0, x0 - extra // 2)
-                x1 = min(frame_width - 1, x1 + (extra - extra // 2))
-            if roi_h < min_size:
-                extra = min_size - roi_h
-                y0 = max(0, y0 - extra // 2)
-                y1 = min(frame_height - 1, y1 + (extra - extra // 2))
-
-        roi_w = x1 - x0 + 1
-        roi_h = y1 - y0 + 1
-        if roi_w <= 0 or roi_h <= 0:
-            return None
-
-        coverage = (roi_w * roi_h) / float(frame_width * frame_height)
-        if coverage >= float(self.roi_max_coverage):
-            return None
-
-        return (x0, y0, x1, y1)
-
-    def _ensure_stride_dir(self, indices):
-        stride = int(self.frame_stride)
-        stride_dir = f"{self.full_video_dir}_stride_{stride}_ref_{self.reference_frame_full}"
-        os.makedirs(stride_dir, exist_ok=True)
-        meta_path = os.path.join(stride_dir, "_stride_meta.json")
-        meta = {
-            "stride": stride,
-            "reference_frame": self.reference_frame_full,
-            "frame_count": len(self.full_frame_names),
-        }
-        if os.path.exists(meta_path):
-            try:
-                existing = json.loads(open(meta_path, "r", encoding="utf-8").read())
-            except Exception:
-                existing = None
-            if existing == meta and len(self._list_frame_files(stride_dir)) == len(indices):
-                return stride_dir
-
-        for idx, src_idx in enumerate(indices):
-            src_name = self.full_frame_names[src_idx]
-            src_path = os.path.join(self.full_video_dir, src_name)
-            dst_name = f"{idx:05d}{os.path.splitext(src_name)[-1]}"
-            dst_path = os.path.join(stride_dir, dst_name)
-            if os.path.exists(dst_path):
-                continue
-            try:
-                os.link(src_path, dst_path)
-            except Exception:
-                shutil.copy2(src_path, dst_path)
-
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(meta, f)
-        return stride_dir
-
-    def _ensure_roi_dir(self, source_dir, source_names, roi_box):
-        x0, y0, x1, y1 = roi_box
-        roi_dir = f"{source_dir}_roi_{x0}_{y0}_{x1}_{y1}"
-        os.makedirs(roi_dir, exist_ok=True)
-        meta_path = os.path.join(roi_dir, "_roi_meta.json")
-        meta = {"roi_box": [x0, y0, x1, y1], "frame_count": len(source_names)}
-        if os.path.exists(meta_path):
-            try:
-                existing = json.loads(open(meta_path, "r", encoding="utf-8").read())
-            except Exception:
-                existing = None
-            if existing == meta and len(self._list_frame_files(roi_dir)) == len(source_names):
-                return roi_dir
-
-        for name in source_names:
-            src_path = os.path.join(source_dir, name)
-            dst_path = os.path.join(roi_dir, name)
-            if os.path.exists(dst_path):
-                continue
-            frame = cv2.imread(src_path)
-            if frame is None:
-                continue
-            crop = frame[y0 : y1 + 1, x0 : x1 + 1]
-            cv2.imwrite(dst_path, crop)
-
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(meta, f)
-        return roi_dir
-
-    @staticmethod
-    def _enhance_red_channel(frame):
-        """Enhance red regions and desaturate non-red to make red markers pop."""
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        # Red in HSV spans two hue ranges
-        mask_low = cv2.inRange(hsv, (0, 70, 50), (10, 255, 255))
-        mask_high = cv2.inRange(hsv, (160, 70, 50), (180, 255, 255))
-        red_mask = mask_low | mask_high
-
-        hsv_f = hsv.astype(np.float32)
-        # Boost red pixels: 1.5x saturation, 1.3x value
-        hsv_f[:, :, 1][red_mask > 0] = np.clip(hsv_f[:, :, 1][red_mask > 0] * 1.5, 0, 255)
-        hsv_f[:, :, 2][red_mask > 0] = np.clip(hsv_f[:, :, 2][red_mask > 0] * 1.3, 0, 255)
-        # Desaturate non-red: 0.7x saturation
-        hsv_f[:, :, 1][red_mask == 0] *= 0.7
-
-        enhanced = cv2.cvtColor(hsv_f.astype(np.uint8), cv2.COLOR_HSV2BGR)
-
-        # CLAHE for local contrast
-        lab = cv2.cvtColor(enhanced, cv2.COLOR_BGR2LAB)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        lab[:, :, 0] = clahe.apply(lab[:, :, 0])
-        enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-
-        return enhanced
-
-    def _ensure_enhanced_dir(self, source_dir, source_names):
-        """Create a directory of red-enhanced frames for SAM2 input."""
-        enhanced_dir = f"{source_dir}_red_enhanced"
-        os.makedirs(enhanced_dir, exist_ok=True)
-        meta_path = os.path.join(enhanced_dir, "_enhance_meta.json")
-        meta = {"frame_count": len(source_names), "version": 1}
-        if os.path.exists(meta_path):
-            try:
-                existing = json.loads(open(meta_path, "r", encoding="utf-8").read())
-            except Exception:
-                existing = None
-            if existing == meta and len(self._list_frame_files(enhanced_dir)) == len(source_names):
-                return enhanced_dir
-
-        for name in source_names:
-            src_path = os.path.join(source_dir, name)
-            dst_path = os.path.join(enhanced_dir, name)
-            if os.path.exists(dst_path):
-                continue
-            frame = cv2.imread(src_path)
-            if frame is None:
-                continue
-            enhanced = self._enhance_red_channel(frame)
-            cv2.imwrite(dst_path, enhanced)
-
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(meta, f)
-        return enhanced_dir
-
-    def _create_chunk_dir(self, chunk_start, chunk_end):
-        """Create a temp directory with hardlinks to only the frames in [chunk_start, chunk_end]."""
-        chunks_root = f"{self.video_dir}_chunks"
-        os.makedirs(chunks_root, exist_ok=True)
-        chunk_dir = os.path.join(chunks_root, f"chunk_{chunk_start}_{chunk_end}")
-        os.makedirs(chunk_dir, exist_ok=True)
-        for local_idx, src_idx in enumerate(range(chunk_start, chunk_end + 1)):
-            src_name = self.frame_names[src_idx]
-            src_path = os.path.join(self.video_dir, src_name)
-            ext = os.path.splitext(src_name)[-1]
-            dst_path = os.path.join(chunk_dir, f"{local_idx:05d}{ext}")
-            if os.path.exists(dst_path):
-                continue
-            try:
-                os.link(src_path, dst_path)
-            except Exception:
-                shutil.copy2(src_path, dst_path)
-        return chunk_dir
-
-    def _cleanup_chunk_dirs(self):
-        """Remove all chunk temp directories."""
-        chunks_root = f"{self.video_dir}_chunks"
-        if os.path.isdir(chunks_root):
-            try:
-                shutil.rmtree(chunks_root)
-            except Exception:
-                pass
-
-    def _prepare_frame_source(self, points_dict):
-        if self._prepared:
-            return
-        self._prepared = True
-
-        total_frames = len(self.full_frame_names)
-        self.frame_index_map = list(range(total_frames))
-        self.video_dir = self.full_video_dir
-        self.frame_names = list(self.full_frame_names)
-        self.reference_frame = max(0, min(self.reference_frame_full, total_frames - 1))
-
-        stride = None
-        if self.frame_stride is not None:
-            try:
-                stride = int(self.frame_stride)
-            except (TypeError, ValueError):
-                stride = None
-        if stride is not None and stride > 1:
-            indices = list(range(self.reference_frame, total_frames, stride))
-            if not indices:
-                indices = [self.reference_frame]
-            self.frame_index_map = indices
-            self.reference_frame = 0
-            self.video_dir = self._ensure_stride_dir(indices)
-            self.frame_names = self._list_frame_files(self.video_dir)
-
-        if self.roi_enabled:
-            first_frame = cv2.imread(os.path.join(self.full_video_dir, self.full_frame_names[0]))
-            if first_frame is not None:
-                full_h, full_w = first_frame.shape[:2]
-                roi_box = self._compute_roi_box(points_dict, full_w, full_h)
-                if roi_box:
-                    self.roi_info = {
-                        "x0": roi_box[0],
-                        "y0": roi_box[1],
-                        "x1": roi_box[2],
-                        "y1": roi_box[3],
-                        "full_width": full_w,
-                        "full_height": full_h,
-                    }
-                    self.video_dir = self._ensure_roi_dir(self.video_dir, self.frame_names, roi_box)
-                    self.frame_names = self._list_frame_files(self.video_dir)
-                else:
-                    self.roi_info = None
-
-        if getattr(self, "enhance_target", False):
-            self.video_dir = self._ensure_enhanced_dir(self.video_dir, self.frame_names)
-            self.frame_names = self._list_frame_files(self.video_dir)
-
-        stride_val = None
-        if self.frame_stride is not None:
-            try:
-                stride_val = int(self.frame_stride)
-            except (TypeError, ValueError):
-                stride_val = None
-        if stride_val and stride_val > 1:
-            self._log(
-                "frame stride enabled: stride=%s processed_frames=%s total_frames=%s"
-                % (stride_val, len(self.frame_names), len(self.full_frame_names))
-            )
-        if self.roi_info:
-            self._log(
-                "roi enabled: box=(%s,%s)-(%s,%s) full_size=%sx%s"
-                % (
-                    self.roi_info["x0"],
-                    self.roi_info["y0"],
-                    self.roi_info["x1"],
-                    self.roi_info["y1"],
-                    self.roi_info["full_width"],
-                    self.roi_info["full_height"],
-                )
-            )
-
-        full_start = self.process_start_frame_full
-        full_end = self.process_end_frame_full
-        if full_start is not None or full_end is not None:
-            try:
-                full_start = int(full_start) if full_start is not None else 0
-            except (TypeError, ValueError):
-                full_start = 0
-            try:
-                full_end = int(full_end) if full_end is not None else total_frames - 1
-            except (TypeError, ValueError):
-                full_end = total_frames - 1
-            full_start = max(0, min(full_start, total_frames - 1))
-            full_end = max(0, min(full_end, total_frames - 1))
-            if full_end < full_start:
-                full_end = full_start
-            if self.reference_frame_full < full_start:
-                full_start = self.reference_frame_full
-            if self.reference_frame_full > full_end:
-                full_end = self.reference_frame_full
-            self.process_start_frame_full = full_start
-            self.process_end_frame_full = full_end
-            local_start, local_end = self._map_full_range_to_local(full_start, full_end)
-            if local_start is not None and local_end is not None and local_end >= local_start:
-                self.process_start_frame = local_start
-                self.process_end_frame = local_end
-                self._log(
-                    "frame range enabled: full=%s-%s local=%s-%s"
-                    % (full_start, full_end, local_start, local_end)
-                )
-
-    def _fill_missing_frames(self, results):
-        if not self.frame_index_map:
-            return results
-        stride = None
-        if self.frame_stride is not None:
-            try:
-                stride = int(self.frame_stride)
-            except (TypeError, ValueError):
-                stride = None
-        if stride is None or stride <= 1:
-            return results
-
-        full_last = len(self.full_frame_names) - 1
-        range_start = 0
-        range_end = full_last
-        if self.process_start_frame_full is not None or self.process_end_frame_full is not None:
-            if self.process_start_frame_full is not None:
-                range_start = max(0, int(self.process_start_frame_full))
-            if self.process_end_frame_full is not None:
-                range_end = min(full_last, int(self.process_end_frame_full))
-            if range_end < range_start:
-                range_end = range_start
-
-        processed = sorted([idx for idx in results.keys() if range_start <= idx <= range_end])
-        if len(processed) < 2:
-            return results
-
-        interpolation = (self.frame_interpolation or "nearest").lower()
-        for prev_idx, next_idx in zip(processed, processed[1:]):
-            if next_idx <= prev_idx + 1:
-                continue
-            gap = next_idx - prev_idx
-            prev_masks = self._get_frame_results(results, prev_idx)
-            next_masks = self._get_frame_results(results, next_idx)
-            for missing in range(prev_idx + 1, next_idx):
-                if interpolation == "linear" and next_masks:
-                    alpha = (missing - prev_idx) / float(gap)
-                    interp_masks = {}
-                    obj_ids = set(prev_masks.keys()) | set(next_masks.keys())
-                    for obj_id in obj_ids:
-                        pm = self._decompress_mask(prev_masks.get(obj_id))
-                        nm = self._decompress_mask(next_masks.get(obj_id))
-                        if pm is None and nm is None:
-                            continue
-                        if pm is None:
-                            mask = nm
-                        elif nm is None:
-                            mask = pm
-                        else:
-                            if pm.shape != nm.shape:
-                                try:
-                                    nm = cv2.resize(
-                                        nm.astype(np.float32),
-                                        (pm.shape[1], pm.shape[0]),
-                                        interpolation=cv2.INTER_LINEAR,
-                                    )
-                                    nm = nm > 0.5
-                                except Exception:
-                                    nm = pm
-                            blend = (1.0 - alpha) * pm.astype(np.float32) + alpha * nm.astype(np.float32)
-                            mask = blend > 0.5
-                        interp_masks[obj_id] = mask
-                    self._store_frame_results(results, missing, interp_masks)
-                else:
-                    self._store_frame_results(results, missing, prev_masks)
-
-        last_idx = processed[-1]
-        if last_idx < range_end:
-            prev_masks = self._get_frame_results(results, last_idx)
-            for missing in range(last_idx + 1, range_end + 1):
-                self._store_frame_results(results, missing, prev_masks)
-        return results
-
     def process_video_with_memory_management(self, points_dict, labels_dict, object_names, debug=True, multiframe_data=None, bboxes_dict=None, progress_callback=None):
-        """Process video with ultra memory management and improved overlap detection."""
-        last_exc = None
+        """Track every annotated object through the whole video with Cutie."""
         self.partial_results = {}
         self._progress_callback = progress_callback
-        self._prepare_frame_source(points_dict)
         try:
             if debug:
                 self._log(
-                    "processing start: frames=%s objects=%s batch_size=%s offload_video=%s offload_state=%s"
-                    % (
-                        len(self.frame_names),
-                        len(object_names),
-                        self.batch_size,
-                        self.offload_video_to_cpu,
-                        self.offload_state_to_cpu,
-                    )
+                    "processing start (Cutie): frames=%s objects=%s bidirectional=%s"
+                    % (len(self.frame_names), len(object_names), self.enable_bidirectional)
                 )
-            configure_torch_ultra_conservative()
-            if self.gpu_memory_fraction is not None and torch.cuda.is_available():
-                torch.cuda.set_per_process_memory_fraction(self.gpu_memory_fraction)
-            for attempt in range(3):
-                try:
-                    if debug:
-                        self._log(
-                            "processing attempt %s: batch_size=%s device=%s"
-                            % (attempt + 1, self.batch_size, getattr(self.predictor, "device", "unknown"))
-                        )
-                    if attempt == 0:
-                        return self._process_standard_optimized(points_dict, labels_dict, object_names, debug, multiframe_data=multiframe_data, bboxes_dict=bboxes_dict)
-                    if attempt == 1:
-                        self.batch_size = self.batch_size // 2
-                        return self._process_standard_optimized(points_dict, labels_dict, object_names, debug, multiframe_data=multiframe_data, bboxes_dict=bboxes_dict)
-                    return self._process_cpu_fallback(points_dict, labels_dict, object_names, debug)
-                except RuntimeError as exc:
-                    if "out of memory" in str(exc).lower():
-                        ultra_cleanup_memory()
-                        if torch.cuda.is_available():
-                            current_fraction = torch.cuda.get_per_process_memory_fraction() * 0.8
-                            torch.cuda.set_per_process_memory_fraction(max(0.3, current_fraction))
-                        if attempt == 2:
-                            raise exc
-                    else:
-                        if debug:
-                            self._log("processing attempt failed: %s" % exc)
-                            self._log(traceback.format_exc())
-                        raise exc
+            return self._run_cutie_tracking(points_dict, labels_dict, object_names, multiframe_data, debug)
         except Exception as exc:
-            last_exc = exc
             if debug:
-                self._log("all processing attempts failed: %s" % exc)
+                self._log("processing failed: %s" % exc)
                 self._log(traceback.format_exc())
-            print(f"All processing attempts failed: {exc}")
             raise
         finally:
             ultra_cleanup_memory()
 
-    def _process_standard_optimized(self, points_dict, labels_dict, object_names, debug, multiframe_data=None, bboxes_dict=None):
-        self._prepare_frame_source(points_dict)
-        image_size = getattr(self.predictor, "image_size", 1024)
-        bytes_per_frame = image_size * image_size * 3 * 4
-        estimated_bytes = bytes_per_frame * len(self.frame_names)
-        max_preload_bytes = 2 * 1024**3
-        max_cache_frames = self.max_cache_frames
-        if max_cache_frames is not None and max_cache_frames <= 0:
-            max_cache_frames = 1
-        if max_cache_frames is not None and max_cache_frames >= len(self.frame_names):
-            max_cache_frames = None
-        if max_cache_frames is None:
-            max_cache_frames = 8 if estimated_bytes > max_preload_bytes else None
-        async_loading_frames = max_cache_frames is None
+    def _frame_to_tensor(self, frame_bgr):
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        return torch.from_numpy(rgb).to(self.device).permute(2, 0, 1).float() / 255.0
+
+    def _seed_mask_from_points(self, frame_bgr, points, labels):
+        """Run MobileSAM on one frame to turn stored click points into a mask."""
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        self.sam_predictor.set_image(rgb)
+        coords = np.array(points, dtype=np.float32)
+        labs = np.array(labels, dtype=np.int32)
+        multimask = len(points) == 1
+        masks, scores, _ = self.sam_predictor.predict(
+            point_coords=coords, point_labels=labs, multimask_output=multimask
+        )
+        best = int(np.argmax(scores))
+        return masks[best].astype(bool)
+
+    def _build_seed_masks(self, points_dict, labels_dict, object_names, multiframe_data):
+        """Turn stored click points into boolean seed masks, per frame."""
+        if multiframe_data:
+            frames_points = {fidx: pts for fidx, (pts, labs, _names) in multiframe_data.items()}
+            frames_labels = {fidx: labs for fidx, (pts, labs, _names) in multiframe_data.items()}
+        else:
+            frames_points = {self.reference_frame: points_dict}
+            frames_labels = {self.reference_frame: labels_dict}
+
+        first_seen_frame = {}
+        for frame_idx, pts_for_frame in frames_points.items():
+            for obj_id in pts_for_frame:
+                if obj_id not in first_seen_frame or frame_idx < first_seen_frame[obj_id]:
+                    first_seen_frame[obj_id] = frame_idx
+
+        all_seeds_by_frame = {}
+        first_seed_by_frame = {}
+        for frame_idx in sorted(frames_points.keys()):
+            pts_for_frame = frames_points[frame_idx]
+            labs_for_frame = frames_labels[frame_idx]
+            frame_path = os.path.join(self.full_video_dir, self.full_frame_names[frame_idx])
+            frame_bgr = cv2.imread(frame_path)
+            if frame_bgr is None:
+                continue
+            for obj_id, pts in pts_for_frame.items():
+                if not pts:
+                    continue
+                labs = labs_for_frame.get(obj_id)
+                mask_bool = self._seed_mask_from_points(frame_bgr, pts, labs)
+                all_seeds_by_frame.setdefault(frame_idx, []).append((obj_id, mask_bool))
+                if first_seen_frame.get(obj_id) == frame_idx:
+                    first_seed_by_frame.setdefault(frame_idx, []).append((obj_id, mask_bool))
+
+        return all_seeds_by_frame, first_seed_by_frame
+
+    def _run_cutie_tracking(self, points_dict, labels_dict, object_names, multiframe_data, debug):
+        from cutie.inference.inference_core import InferenceCore
 
         self.object_names = object_names
-        targets_found = False
+
         for obj_id, obj_name in object_names.items():
-            if self.overlap_tracker.register_target(obj_id, obj_name):
-                targets_found = True
+            self.overlap_tracker.register_target(obj_id, obj_name)
+
+        all_seeds_by_frame, first_seed_by_frame = self._build_seed_masks(
+            points_dict, labels_dict, object_names, multiframe_data
+        )
+        if not all_seeds_by_frame:
+            raise ValueError("No valid seed points to track")
+
+        total_frames = len(self.frame_names)
+        last_frame = total_frames - 1
+        if self.process_end_frame_full is not None:
+            last_frame = min(last_frame, int(self.process_end_frame_full))
+
+        global_start = min(all_seeds_by_frame.keys())
+        if self.process_start_frame_full is not None:
+            global_start = max(global_start, int(self.process_start_frame_full))
+        max_first_seed = max(first_seed_by_frame.keys())
+        run_backward = self.enable_bidirectional and max_first_seed > 0
+
+        forward_total = max(0, last_frame - global_start + 1)
+        backward_total = (max_first_seed + 1) if run_backward else 0
+        grand_total = max(1, forward_total + backward_total)
 
         results = {}
         self.partial_results = results
         frame_analyses = {}
-        frame_count = 0
-        overlap_count = 0
-        last_memory_check = 0
 
-        use_disk_mode = False
         mem_info = get_system_memory_info()
         if self.disk_store_enabled:
-            if len(self.frame_names) >= 2000:
-                use_disk_mode = True
+            if total_frames >= 2000:
                 self._enable_disk_store(results, reason="long video")
-            elif mem_info and mem_info.get("percent_used", 0) >= 70:
-                use_disk_mode = True
-                self._enable_disk_store(
+            elif mem_info and mem_info.get("percent_used", 0) >= self.ram_pressure_threshold:
+                self._enable_disk_store(results, reason=f"ram usage {mem_info.get('percent_used', 0):.0f}%")
+
+        done_so_far = 0
+        progress_cb = getattr(self, "_progress_callback", None)
+
+        def _report(done, total):
+            if progress_cb and (done % 20 == 0 or done == total):
+                try:
+                    progress_cb(done_so_far + done, grand_total)
+                except Exception:
+                    pass
+
+        autocast_ctx = (
+            torch.autocast(device_type="cuda", dtype=torch.float16)
+            if self.device.type == "cuda"
+            else contextlib.nullcontext()
+        )
+
+        forward_processor = InferenceCore(self.cutie_model, cfg=self.cutie_model.cfg)
+        forward_processor.max_internal_size = self.max_internal_size
+        with torch.inference_mode(), autocast_ctx:
+            self._propagate_cutie(
+                forward_processor,
+                range(global_start, last_frame + 1),
+                all_seeds_by_frame,
+                object_names,
+                results,
+                frame_analyses,
+                merge_mode="overwrite",
+                progress_cb=_report,
+            )
+        done_so_far = forward_total
+
+        if run_backward:
+            backward_processor = InferenceCore(self.cutie_model, cfg=self.cutie_model.cfg)
+            backward_processor.max_internal_size = self.max_internal_size
+            with torch.inference_mode(), autocast_ctx:
+                self._propagate_cutie(
+                    backward_processor,
+                    range(max_first_seed, -1, -1),
+                    first_seed_by_frame,
+                    object_names,
                     results,
-                    reason=f"ram usage {mem_info.get('percent_used', 0):.0f}%",
+                    frame_analyses,
+                    merge_mode="fill_missing",
+                    progress_cb=_report,
                 )
 
-        total_frames = len(self.frame_names)
-        start_frame = max(0, min(self.reference_frame, total_frames - 1))
-        if self.enable_bidirectional:
-            range_start = self.process_start_frame if self.process_start_frame is not None else 0
-        else:
-            range_start = self.process_start_frame if self.process_start_frame is not None else start_frame
-        range_end = self.process_end_frame if self.process_end_frame is not None else total_frames - 1
-        if self.enable_bidirectional:
-            range_start = max(0, min(int(range_start), total_frames - 1))
-        else:
-            range_start = max(start_frame, min(int(range_start), total_frames - 1))
-        range_end = max(range_start, min(int(range_end), total_frames - 1))
-        total_to_process = max(0, range_end - range_start + 1)
-        self._total_to_process = total_to_process
-        if self.process_start_frame is not None or self.process_end_frame is not None:
-            self._log(
-                "processing range: start=%s end=%s (local frames)"
-                % (range_start, range_end)
-            )
-
-        # --- Compute chunk_size BEFORE init_state to avoid OOM ---
-        chunk_size = None
-        if self.chunk_size is not None:
-            try:
-                chunk_size = int(self.chunk_size)
-            except (TypeError, ValueError):
-                chunk_size = None
-        if chunk_size is not None and chunk_size <= 0:
-            chunk_size = None
-        if chunk_size is not None and chunk_size >= total_to_process:
-            chunk_size = None
-        chunk_overlap = self.chunk_overlap if self.chunk_overlap is not None else 1
-        try:
-            chunk_overlap = max(1, int(chunk_overlap))
-        except (TypeError, ValueError):
-            chunk_overlap = 1
-
-        # Auto-force-chunking: if loading all frames would exceed available RAM
-        if chunk_size is None:
-            sys_mem = get_system_memory_info()
-            available_bytes = (sys_mem["available_gb"] * 1024**3) if sys_mem else None
-            if available_bytes and estimated_bytes > available_bytes * 0.8:
-                safe_frames = max(100, int((available_bytes * 0.5) / bytes_per_frame))
-                chunk_size = min(safe_frames, 1000)
-                self._log(
-                    "auto-chunking: estimated_gb=%.2f available_gb=%.2f chunk_size=%d"
-                    % (estimated_bytes / 1024**3, available_bytes / 1024**3, chunk_size)
-                )
-
-        # Only call init_state for the non-chunked path (safe: fewer frames)
-        inference_state = None
-        if chunk_size is None:
-            inference_state = self.predictor.init_state(
-                video_path=self.video_dir,
-                offload_video_to_cpu=self.offload_video_to_cpu,
-                offload_state_to_cpu=self.offload_state_to_cpu,
-                async_loading_frames=async_loading_frames,
-            )
-            self.predictor.reset_state(inference_state)
-            ultra_cleanup_memory()
-            if debug:
-                self._log(
-                    "init_state: num_frames=%s video_size=%sx%s image_size=%s async_loading_frames=%s max_cache_frames=%s estimated_video_gb=%.2f"
-                    % (
-                        inference_state.get("num_frames"),
-                        inference_state.get("video_width"),
-                        inference_state.get("video_height"),
-                        image_size,
-                        async_loading_frames,
-                        max_cache_frames,
-                        estimated_bytes / (1024**3),
-                    )
-                )
-
-        def _process_frames(
-            inference_state,
-            start_frame_idx,
-            max_frame_num_to_track,
-            skip_until,
-            frame_offset=0,
-            reverse=False,
-        ):
-            nonlocal frame_count, last_memory_check, overlap_count
-            last_masks = {}
-            last_processed = None
-            for out_frame_idx, out_obj_ids, out_mask_logits in self.predictor.propagate_in_video(
-                inference_state,
-                start_frame_idx=start_frame_idx,
-                max_frame_num_to_track=max_frame_num_to_track,
-                reverse=reverse,
-            ):
-                if not reverse and out_frame_idx < skip_until:
-                    continue
-                try:
-                    actual_idx = out_frame_idx + frame_offset
-                    global_frame_idx = self._map_frame_idx(actual_idx)
-                    if reverse and global_frame_idx in results:
-                        continue
-                    if frame_count - last_memory_check >= 50:
-                        gpu_info = get_gpu_memory_info()
-                        if gpu_info and gpu_info["utilization_pct"] > 90:
-                            ultra_cleanup_memory()
-                        is_pressured, mem_info = check_memory_pressure(self.ram_pressure_threshold)
-                        if is_pressured and not self._disk_store_active:
-                            use_disk_mode = True
-                            pct = mem_info.get("percent_used", 0) if mem_info else 0
-                            self._enable_disk_store(results, reason=f"ram pressure {pct:.0f}%")
-                        last_memory_check = frame_count
-
-                    frame_results = {}
-                    for i, out_obj_id in enumerate(out_obj_ids):
-                        mask = (out_mask_logits[i] > 0.0).cpu().numpy()
-                        if len(mask.shape) == 3:
-                            mask = mask[0]
-                        frame_results[out_obj_id] = mask.copy()
-                        last_masks[out_obj_id] = mask.copy()
-                        del mask
-
-                    self._store_frame_results(results, global_frame_idx, frame_results)
-
-                    if targets_found and not reverse:
-                        frame_analysis = self.overlap_tracker.track_frame_overlaps_batch(
-                            global_frame_idx, frame_results, object_names
-                        )
-                        self._maybe_emit_preview(actual_idx, frame_results, frame_analysis)
-                        frame_analyses[global_frame_idx] = frame_analysis
-                        if frame_analysis.get("target_overlaps"):
-                            overlap_count += 1
-                    else:
-                        # For backward frames: analyze overlaps for preview only
-                        # (no event tracking — that happens in post-processing pass)
-                        bwd_analysis = None
-                        if targets_found and reverse:
-                            bwd_analysis = self.overlap_tracker.analyze_frame_overlaps(
-                                frame_results, object_names
-                            )
-                        self._maybe_emit_preview(actual_idx, frame_results, bwd_analysis)
-
-                    frame_count += 1
-                    pbar.update(1)
-                    if self._progress_callback and frame_count % 20 == 0:
-                        try:
-                            self._progress_callback(frame_count, self._total_to_process)
-                        except Exception:
-                            pass
-
-                    if frame_count % 25 == 0:
-                        ultra_cleanup_memory()
-
-                    last_processed = out_frame_idx + frame_offset
-                    del out_mask_logits, frame_results
-                except Exception as exc:
-                    if debug:
-                        self._log(
-                            "frame error: frame_idx=%s obj_ids=%s mask_logits=%s error=%s"
-                            % (
-                                out_frame_idx + frame_offset,
-                                list(out_obj_ids) if out_obj_ids is not None else None,
-                                _format_tensor_info(out_mask_logits),
-                                exc,
-                            )
-                        )
-                        self._log(traceback.format_exc())
-                    print(f"  Error processing frame {out_frame_idx + frame_offset}: {exc}")
-                    pbar.update(1)
-                    ultra_cleanup_memory()
-                    continue
-            return last_processed, last_masks
-
-        with tqdm(total=total_to_process, desc="Processing frames") as pbar:
-            if chunk_size is None:
-                for obj_id in points_dict:
-                    try:
-                        points = np.array(points_dict[obj_id], dtype=np.float32)
-                        labels = np.array(labels_dict[obj_id], dtype=np.int32)
-                        sam_kwargs = dict(
-                            inference_state=inference_state,
-                            frame_idx=start_frame,
-                            obj_id=obj_id,
-                            points=points,
-                            labels=labels,
-                        )
-                        if bboxes_dict and obj_id in bboxes_dict:
-                            sam_kwargs["box"] = bboxes_dict[obj_id]
-                        _, out_obj_ids, out_mask_logits = self.predictor.add_new_points_or_box(**sam_kwargs)
-                        del out_mask_logits, points, labels
-                        ultra_cleanup_memory()
-                    except Exception as exc:
-                        if debug:
-                            self._log(
-                                "add prompts failed: obj_id=%s points=%s labels=%s error=%s"
-                                % (
-                                    obj_id,
-                                    _format_points_info(points_dict.get(obj_id)),
-                                    _format_tensor_info(labels_dict.get(obj_id)),
-                                    exc,
-                                )
-                            )
-                            self._log(traceback.format_exc())
-                        print(f"  Error adding prompts for object {obj_id}: {exc}")
-                        continue
-
-                # Multiframe: add conditioning prompts from additional annotated frames
-                if multiframe_data and len(multiframe_data) > 1:
-                    if debug:
-                        self._log(
-                            "multiframe: adding %s additional conditioning frames"
-                            % (len(multiframe_data) - 1)
-                        )
-                    for mf_idx, (mf_points, mf_labels, _) in multiframe_data.items():
-                        if mf_idx == start_frame:
-                            continue
-                        for obj_id in mf_points:
-                            try:
-                                pts = np.array(mf_points[obj_id], dtype=np.float32)
-                                lbs = np.array(mf_labels[obj_id], dtype=np.int32)
-                                mf_kwargs = dict(
-                                    inference_state=inference_state,
-                                    frame_idx=mf_idx,
-                                    obj_id=obj_id,
-                                    points=pts,
-                                    labels=lbs,
-                                )
-                                if bboxes_dict and obj_id in bboxes_dict:
-                                    mf_kwargs["box"] = bboxes_dict[obj_id]
-                                _, _, out_ml = self.predictor.add_new_points_or_box(**mf_kwargs)
-                                del out_ml, pts, lbs
-                                ultra_cleanup_memory()
-                            except Exception as exc:
-                                if debug:
-                                    self._log(
-                                        "multiframe add failed: frame=%s obj_id=%s error=%s"
-                                        % (mf_idx, obj_id, exc)
-                                    )
-                                continue
-
-                max_track = range_end - start_frame
-                max_track = max(0, max_track)
-                last_processed, _ = _process_frames(
-                    inference_state,
-                    start_frame,
-                    max_track,
-                    range_start,
-                )
-                if last_processed is None:
-                    ultra_cleanup_memory()
-
-                # Backward propagation (if enabled and reference frame > range_start)
-                if self.enable_bidirectional and start_frame > range_start:
-                    if debug:
-                        self._log(
-                            "bidirectional: starting backward propagation from frame %s to %s"
-                            % (start_frame, range_start)
-                        )
-                    self.predictor.reset_state(inference_state)
-                    ultra_cleanup_memory()
-
-                    # Re-add prompts at reference frame
-                    for obj_id in points_dict:
-                        try:
-                            pts = np.array(points_dict[obj_id], dtype=np.float32)
-                            lbs = np.array(labels_dict[obj_id], dtype=np.int32)
-                            bw_kwargs = dict(
-                                inference_state=inference_state,
-                                frame_idx=start_frame,
-                                obj_id=obj_id,
-                                points=pts,
-                                labels=lbs,
-                            )
-                            if bboxes_dict and obj_id in bboxes_dict:
-                                bw_kwargs["box"] = bboxes_dict[obj_id]
-                            _, _, out_ml = self.predictor.add_new_points_or_box(**bw_kwargs)
-                            del out_ml, pts, lbs
-                            ultra_cleanup_memory()
-                        except Exception as exc:
-                            if debug:
-                                self._log("backward add prompts failed: obj_id=%s error=%s" % (obj_id, exc))
-                            continue
-
-                    # Propagate backward
-                    max_track_backward = start_frame - range_start
-                    for out_frame_idx, out_obj_ids, out_mask_logits in self.predictor.propagate_in_video(
-                        inference_state,
-                        start_frame_idx=start_frame,
-                        max_frame_num_to_track=max_track_backward,
-                        reverse=True,
-                    ):
-                        try:
-                            global_frame_idx = self._map_frame_idx(out_frame_idx)
-                            if global_frame_idx in results:
-                                continue  # Don't overwrite forward results
-                            frame_result_raw = {}
-                            frame_result = {}
-                            for idx_in_batch, obj_id in enumerate(out_obj_ids):
-                                mask = (out_mask_logits[idx_in_batch] > 0.0).cpu().numpy().astype(np.uint8)
-                                if mask.ndim == 3:
-                                    mask = mask[0]
-                                frame_result_raw[int(obj_id)] = mask
-                                if self.compress_masks:
-                                    frame_result[int(obj_id)] = self._compress_mask(mask)
-                                else:
-                                    frame_result[int(obj_id)] = mask
-                            self._store_frame_results(results, global_frame_idx, frame_result)
-                            # Preview with overlap analysis (no event tracking)
-                            bwd_analysis = None
-                            if targets_found:
-                                bwd_analysis = self.overlap_tracker.analyze_frame_overlaps(
-                                    frame_result_raw, object_names
-                                )
-                            self._maybe_emit_preview(out_frame_idx, frame_result_raw, bwd_analysis)
-                            del frame_result_raw
-                            frame_count += 1
-                            pbar.update(1)
-                            if self._progress_callback and frame_count % 20 == 0:
-                                try:
-                                    self._progress_callback(frame_count, self._total_to_process)
-                                except Exception:
-                                    pass
-                        except Exception as exc:
-                            if debug:
-                                self._log("backward frame error: frame_idx=%s error=%s" % (out_frame_idx, exc))
-                            continue
-                    ultra_cleanup_memory()
-                    if debug:
-                        self._log("bidirectional: backward propagation complete")
-            else:
-                if debug:
-                    self._log("chunked mode: chunk_size=%s chunk_overlap=%s total_frames=%s" % (chunk_size, chunk_overlap, total_frames))
-                next_start = range_start
-                seed_masks = None
-                chunk_index = 0
-                try:
-                    while next_start <= range_end:
-                        seed_frame = start_frame if chunk_index == 0 else max(start_frame, next_start - chunk_overlap)
-                        remaining = range_end - next_start + 1
-                        desired_new = min(chunk_size, remaining)
-                        if chunk_index == 0:
-                            max_track = max(0, desired_new - 1)
-                        else:
-                            max_track = max(0, desired_new + chunk_overlap - 1)
-                        skip_needed = max(0, next_start - seed_frame)
-                        max_track = max(max_track, skip_needed)
-                        max_track = min(max_track, max(0, range_end - seed_frame))
-                        chunk_end = min(seed_frame + max_track, len(self.frame_names) - 1)
-
-                        # Create a temp dir with only this chunk's frames
-                        chunk_dir = self._create_chunk_dir(seed_frame, chunk_end)
-                        if debug:
-                            self._log("chunk %d: frames %d-%d (%d frames) dir=%s" % (
-                                chunk_index, seed_frame, chunk_end, chunk_end - seed_frame + 1, chunk_dir))
-
-                        chunk_inference_state = self.predictor.init_state(
-                            video_path=chunk_dir,
-                            offload_video_to_cpu=self.offload_video_to_cpu,
-                            offload_state_to_cpu=self.offload_state_to_cpu,
-                            async_loading_frames=async_loading_frames,
-                        )
-                        self.predictor.reset_state(chunk_inference_state)
-                        ultra_cleanup_memory()
-
-                        # Convert global seed_frame to local index within chunk
-                        local_seed = seed_frame - seed_frame  # always 0
-                        local_skip = max(0, next_start - seed_frame)
-
-                        if chunk_index == 0:
-                            for obj_id in points_dict:
-                                try:
-                                    points = np.array(points_dict[obj_id], dtype=np.float32)
-                                    labels = np.array(labels_dict[obj_id], dtype=np.int32)
-                                    ck_kwargs = dict(
-                                        inference_state=chunk_inference_state,
-                                        frame_idx=local_seed,
-                                        obj_id=obj_id,
-                                        points=points,
-                                        labels=labels,
-                                    )
-                                    if bboxes_dict and obj_id in bboxes_dict:
-                                        ck_kwargs["box"] = bboxes_dict[obj_id]
-                                    _, out_obj_ids, out_mask_logits = self.predictor.add_new_points_or_box(**ck_kwargs)
-                                    del out_mask_logits, points, labels
-                                    ultra_cleanup_memory()
-                                except Exception as exc:
-                                    if debug:
-                                        self._log(
-                                            "add prompts failed: obj_id=%s points=%s labels=%s error=%s"
-                                            % (
-                                                obj_id,
-                                                _format_points_info(points_dict.get(obj_id)),
-                                                _format_tensor_info(labels_dict.get(obj_id)),
-                                                exc,
-                                            )
-                                        )
-                                        self._log(traceback.format_exc())
-                                    print(f"  Error adding prompts for object {obj_id}: {exc}")
-                                    continue
-                        else:
-                            for obj_id, mask in (seed_masks or {}).items():
-                                if mask is None:
-                                    continue
-                                try:
-                                    self.predictor.add_new_mask(
-                                        inference_state=chunk_inference_state,
-                                        frame_idx=local_seed,
-                                        obj_id=obj_id,
-                                        mask=mask,
-                                    )
-                                except Exception as exc:
-                                    if debug:
-                                        self._log("seed mask failed: obj_id=%s error=%s" % (obj_id, exc))
-                                        self._log(traceback.format_exc())
-                                    continue
-
-                        local_max_track = chunk_end - seed_frame
-                        last_processed, seed_masks = _process_frames(
-                            chunk_inference_state,
-                            local_seed,
-                            local_max_track,
-                            local_skip,
-                            frame_offset=seed_frame,
-                        )
-                        self.predictor.reset_state(chunk_inference_state)
-                        ultra_cleanup_memory()
-
-                        # Clean up this chunk dir immediately to save disk space
-                        try:
-                            shutil.rmtree(chunk_dir)
-                        except Exception:
-                            pass
-
-                        if last_processed is None:
-                            break
-                        next_start = last_processed + 1
-                        chunk_index += 1
-                finally:
-                    self._cleanup_chunk_dirs()
-
-                # Backward chunked propagation (bidirectional)
-                if self.enable_bidirectional and start_frame > range_start:
-                    if debug:
-                        self._log(
-                            "chunked bidirectional: backward from frame %s to %s"
-                            % (start_frame, range_start)
-                        )
-                    next_end = start_frame
-                    seed_masks_bwd = None
-                    bwd_chunk_idx = 0
-                    try:
-                        while next_end >= range_start:
-                            if bwd_chunk_idx == 0:
-                                # First backward chunk: seed at reference frame
-                                seed_frame_bwd = start_frame
-                            else:
-                                # Subsequent: overlap into previous chunk
-                                seed_frame_bwd = min(
-                                    next_end + chunk_overlap, start_frame
-                                )
-                            chunk_start_bwd = max(
-                                range_start, seed_frame_bwd - chunk_size + 1
-                            )
-                            chunk_end_bwd = seed_frame_bwd
-
-                            chunk_dir = self._create_chunk_dir(
-                                chunk_start_bwd, chunk_end_bwd
-                            )
-                            if debug:
-                                self._log(
-                                    "backward chunk %d: frames %d-%d (%d frames) dir=%s"
-                                    % (
-                                        bwd_chunk_idx,
-                                        chunk_start_bwd,
-                                        chunk_end_bwd,
-                                        chunk_end_bwd - chunk_start_bwd + 1,
-                                        chunk_dir,
-                                    )
-                                )
-
-                            chunk_inference_state = self.predictor.init_state(
-                                video_path=chunk_dir,
-                                offload_video_to_cpu=self.offload_video_to_cpu,
-                                offload_state_to_cpu=self.offload_state_to_cpu,
-                                async_loading_frames=async_loading_frames,
-                            )
-                            self.predictor.reset_state(chunk_inference_state)
-                            ultra_cleanup_memory()
-
-                            # Local index of seed (at end of chunk)
-                            local_seed_bwd = chunk_end_bwd - chunk_start_bwd
-
-                            if bwd_chunk_idx == 0:
-                                # First chunk: add user prompts at reference frame
-                                for obj_id in points_dict:
-                                    try:
-                                        points = np.array(
-                                            points_dict[obj_id], dtype=np.float32
-                                        )
-                                        labels = np.array(
-                                            labels_dict[obj_id], dtype=np.int32
-                                        )
-                                        bwd_kwargs = dict(
-                                            inference_state=chunk_inference_state,
-                                            frame_idx=local_seed_bwd,
-                                            obj_id=obj_id,
-                                            points=points,
-                                            labels=labels,
-                                        )
-                                        if bboxes_dict and obj_id in bboxes_dict:
-                                            bwd_kwargs["box"] = bboxes_dict[obj_id]
-                                        _, _, out_mask_logits = (
-                                            self.predictor.add_new_points_or_box(**bwd_kwargs)
-                                        )
-                                        del out_mask_logits, points, labels
-                                        ultra_cleanup_memory()
-                                    except Exception as exc:
-                                        if debug:
-                                            self._log(
-                                                "backward add prompts failed: obj_id=%s error=%s"
-                                                % (obj_id, exc)
-                                            )
-                                        continue
-                            else:
-                                # Subsequent chunks: seed with masks from previous chunk
-                                for obj_id, mask in (seed_masks_bwd or {}).items():
-                                    if mask is None:
-                                        continue
-                                    try:
-                                        self.predictor.add_new_mask(
-                                            inference_state=chunk_inference_state,
-                                            frame_idx=local_seed_bwd,
-                                            obj_id=obj_id,
-                                            mask=mask,
-                                        )
-                                    except Exception as exc:
-                                        if debug:
-                                            self._log(
-                                                "backward seed mask failed: obj_id=%s error=%s"
-                                                % (obj_id, exc)
-                                            )
-                                        continue
-
-                            local_max_track_bwd = local_seed_bwd
-                            last_processed_bwd, seed_masks_bwd = _process_frames(
-                                chunk_inference_state,
-                                local_seed_bwd,
-                                local_max_track_bwd,
-                                0,
-                                frame_offset=chunk_start_bwd,
-                                reverse=True,
-                            )
-                            self.predictor.reset_state(chunk_inference_state)
-                            ultra_cleanup_memory()
-
-                            try:
-                                shutil.rmtree(chunk_dir)
-                            except Exception:
-                                pass
-
-                            if last_processed_bwd is None:
-                                break
-                            next_end = last_processed_bwd - 1
-                            bwd_chunk_idx += 1
-                    finally:
-                        self._cleanup_chunk_dirs()
-                    if debug:
-                        self._log(
-                            "chunked bidirectional: backward propagation complete"
-                        )
-
-        if targets_found:
-            last_frame = max(results.keys()) if results else 0
-            self.overlap_tracker.finalize_tracking(last_frame)
-
-            # Post-process backward frames for overlap tracking
-            # Backward propagation skips overlap tracking (frames arrive in
-            # reverse order which corrupts the event tracker).  We run it here
-            # in chronological order so ELAN/CSV get correct overlap data.
-            if self.enable_bidirectional and start_frame > range_start:
-                ref_global = self._map_frame_idx(start_frame)
-                backward_indices = sorted(
-                    idx for idx in results.keys()
-                    if idx < ref_global and idx not in frame_analyses
-                )
-                if backward_indices:
-                    if debug:
-                        self._log(
-                            "backward overlap pass: %d frames" % len(backward_indices)
-                        )
-                    for bwd_idx in backward_indices:
-                        bwd_frame_results = self._get_frame_results(results, bwd_idx)
-                        if not bwd_frame_results:
-                            continue
-                        decompressed = {}
-                        for obj_id, mask in bwd_frame_results.items():
-                            m = self._decompress_mask(mask)
-                            if m is not None:
-                                decompressed[obj_id] = m
-                        if decompressed:
-                            frame_analysis = (
-                                self.overlap_tracker.track_frame_overlaps_batch(
-                                    bwd_idx, decompressed, object_names
-                                )
-                            )
-                            frame_analyses[bwd_idx] = frame_analysis
-                    # Finalize any open backward events
-                    self.overlap_tracker.finalize_tracking(backward_indices[0])
-
-        results = self._fill_missing_frames(results)
+        self.overlap_tracker.finalize_tracking(last_frame)
         self.frame_analyses = frame_analyses
-        if chunk_size is None:
-            self.predictor.reset_state(inference_state)
-            ultra_cleanup_memory()
         return results
 
-    def _process_cpu_fallback(self, points_dict, labels_dict, object_names, debug):
-        print("Emergency CPU fallback - this will be slow but stable")
-        if debug:
-            self._log("cpu fallback: moving model to cpu")
-        if hasattr(self.predictor.model, "to"):
-            self.predictor.model = self.predictor.model.to("cpu")
-        ultra_cleanup_memory()
-        return None
+    def _propagate_cutie(self, processor, frame_range, seeds_by_frame, object_names, results, frame_analyses, merge_mode, progress_cb):
+        """Propagates Cutie using the "frame_range" (ascending=forward, descending=backward)"""
+        targets_found = self.overlap_tracker.has_targets()
+        total = len(frame_range)
+        for done, frame_idx in enumerate(frame_range, start=1):
+            frame_path = os.path.join(self.full_video_dir, self.full_frame_names[frame_idx])
+            frame_bgr = cv2.imread(frame_path)
+            if frame_bgr is None:
+                break
+            image = self._frame_to_tensor(frame_bgr)
+
+            seeds_here = seeds_by_frame.get(frame_idx)
+            if seeds_here:
+                h, w = frame_bgr.shape[:2]
+                combined = np.zeros((h, w), dtype=np.uint8)
+                claim_count = np.zeros((h, w), dtype=np.uint8)
+                obj_ids = []
+                for obj_id, mask_bool in seeds_here:
+                    combined[mask_bool] = obj_id
+                    claim_count[mask_bool] += 1
+                    obj_ids.append(obj_id)
+                combined[claim_count > 1] = 0
+
+                already_known = set(processor.object_manager.all_obj_ids)
+                reintroducing = [oid for oid in obj_ids if oid in already_known]
+                if reintroducing:
+                    processor.delete_objects(reintroducing)
+
+                mask_tensor = torch.from_numpy(combined).to(self.device)
+                output_prob = processor.step(image, mask_tensor, objects=sorted(obj_ids))
+            else:
+                output_prob = processor.step(image)
+
+            pred_mask = processor.output_prob_to_mask(output_prob).cpu().numpy().astype(np.uint8)
+            present_ids = [oid for oid in np.unique(pred_mask).tolist() if oid != 0]
+            frame_results = {oid: (pred_mask == oid) for oid in present_ids}
+
+            if merge_mode == "fill_missing":
+                existing = self._get_frame_results(results, frame_idx)
+                merged = dict(existing)
+                for oid, mask in frame_results.items():
+                    merged.setdefault(oid, mask)
+                frame_results = merged
+
+            self._store_frame_results(results, frame_idx, frame_results)
+
+            frame_analysis = None
+            if targets_found:
+                frame_analysis = self.overlap_tracker.track_frame_overlaps_batch(frame_idx, frame_results, object_names)
+                frame_analyses[frame_idx] = frame_analysis
+            self._maybe_emit_preview(frame_idx, frame_results, frame_analysis)
+
+            progress_cb(done, total)
 
     def _maybe_emit_preview(self, frame_idx, frame_results, frame_analysis):
         cb = getattr(self, "preview_callback", None)
@@ -1960,7 +1040,7 @@ class UltraOptimizedProcessor:
         results,
         output_path,
         fps=30,
-        show_original=True,
+        show_original=False,
         alpha=0.5,
         frame_limit=None,
         progress_callback=None,
@@ -1977,7 +1057,10 @@ class UltraOptimizedProcessor:
 
         out_width = width * 2 if show_original else width
         out = None
-        for codec in ("mp4v", "H264", "avc1"):
+        # Try H.264 first, mp4v (old-style software MPEG-4) used to be
+        # tried first and almost always "succeeds" (opens fine), so H264/
+        # avc1 never got a chance even when available.
+        for codec in ("avc1", "H264", "mp4v"):
             fourcc = cv2.VideoWriter_fourcc(*codec)
             out = cv2.VideoWriter(output_path, fourcc, fps, (int(out_width), int(height)))
             if out.isOpened():
@@ -2017,9 +1100,15 @@ class UltraOptimizedProcessor:
             if has_looking_at_events:
                 overlap_frame_count += 1
 
+            # Read once -- with the disk-backed mask store this re-reads and
+            # reconstructs the frame's masks from disk, so calling it twice
+            # per frame (once here, once below) doubled that cost on every
+            # frame that has any target-overlap data, which is most/all
+            # frames whenever any object is marked as a target.
+            frame_results = self._get_frame_results(results, frame_idx)
+
             looking_at_info = {}
             if frame_analysis:
-                frame_results = self._get_frame_results(results, frame_idx)
                 for obj_id in frame_results:
                     looking_at_info[obj_id] = {
                         "is_target": False,
@@ -2042,7 +1131,6 @@ class UltraOptimizedProcessor:
                             looking_at_info[obj_id]["looked_at_by"].append(target_name)
                             looking_at_info[obj_id]["is_being_looked_at"] = True
 
-            frame_results = self._get_frame_results(results, frame_idx)
             if frame_results:
                 for obj_id, mask in frame_results.items():
                     mask = self._decompress_mask(mask)

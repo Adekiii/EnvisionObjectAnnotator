@@ -382,7 +382,7 @@ def extract_frames(payload: FrameExtractionRequest):
             cmd.extend(["-t", str(duration)])
         else:
             cmd.extend(["-t", str(payload.end_time)])
-    cmd.extend(["-r", str(fps), "-q:v", str(payload.quality), "-vsync", "cfr", "-start_number", "0", output_pattern])
+    cmd.extend(["-r", str(fps), "-q:v", str(payload.quality), "-fps_mode", "cfr", "-start_number", "0", output_pattern])
 
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0:
@@ -400,7 +400,7 @@ def extract_frames(payload: FrameExtractionRequest):
             thumb_cmd.extend(["-t", str(duration)])
         else:
             thumb_cmd.extend(["-t", str(payload.end_time)])
-    thumb_cmd.extend(["-r", str(fps), "-q:v", "5", "-vsync", "cfr", "-vf", "scale='min(640,iw)':-1", "-start_number", "0", thumb_pattern])
+    thumb_cmd.extend(["-r", str(fps), "-q:v", "5", "-fps_mode", "cfr", "-vf", "scale='min(640,iw)':-1", "-start_number", "0", thumb_pattern])
     thumb_result = subprocess.run(thumb_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if thumb_result.returncode != 0:
         print(f"[thumbs] generation failed: {thumb_result.stderr.strip()}")
@@ -637,6 +637,41 @@ def get_frame_annotations(session_id: str, frame_index: int):
     return data
 
 
+@app.get("/annotation/objects/{session_id}")
+def list_annotation_objects(session_id: str):
+    """Gets a list of all annotated objects."""
+    try:
+        state.get_session(session_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    annotations_dir = SESSIONS_DIR / session_id / "annotations"
+    objects = {}
+    if annotations_dir.exists():
+        for frame_file in sorted(annotations_dir.glob("frame_*.json")):
+            try:
+                data = json.loads(frame_file.read_text())
+            except json.JSONDecodeError:
+                continue
+            frame_idx = data.get("frame_index")
+            if frame_idx is None:
+                try:
+                    frame_idx = int(frame_file.stem.split("_")[1])
+                except (IndexError, ValueError):
+                    continue
+            for name, pts in (data.get("objects") or {}).items():
+                if not pts:
+                    continue
+                entry = objects.setdefault(name, {"frames": [], "point_count": 0})
+                entry["frames"].append(frame_idx)
+                entry["point_count"] += len(pts)
+
+    for entry in objects.values():
+        entry["frames"].sort()
+
+    return {"objects": objects}
+
+
 @app.post("/config", response_model=Session)
 def update_config(payload: ConfigUpdate):
     try:
@@ -745,15 +780,11 @@ def test_mask(payload: AnnotationPayload):
     ilog.log_test_mask(payload.session_id, payload.frame_index, payload.object_name, len(payload.points))
 
     try:
-        bbox_dict = None
-        if payload.bbox:
-            bbox_dict = payload.bbox.model_dump()
-        preview_path = test_mask_preview(
+        result = test_mask_preview(
             payload.session_id,
             payload.frame_index,
             payload.object_name,
             [p.model_dump() for p in payload.points],
-            bbox=bbox_dict,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
@@ -761,16 +792,8 @@ def test_mask(payload: AnnotationPayload):
     return {
         "status": "ok",
         "message": "Mask preview generated",
-        "preview_url": f"/previews/{payload.session_id}/{preview_path.name}",
+        **result,
     }
-
-
-@app.get("/previews/{session_id}/{file_name}")
-def get_preview(session_id: str, file_name: str):
-    preview_path = SESSIONS_DIR / session_id / "previews" / file_name
-    if not preview_path.exists():
-        raise HTTPException(status_code=404, detail="Preview not found")
-    return FileResponse(preview_path)
 
 
 @app.post("/processing/start", response_model=ProcessingStatus)

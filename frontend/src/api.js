@@ -139,6 +139,14 @@ export async function fetchFrameAnnotations(sessionId, frameIndex) {
   return res.json();
 }
 
+export async function fetchSessionObjects(sessionId) {
+  const res = await fetch(`${API_BASE}/annotation/objects/${sessionId}`);
+  if (!res.ok) {
+    throw new Error("Failed to load object list");
+  }
+  return res.json();
+}
+
 export async function startProcessing(sessionId) {
   const res = await fetch(`${API_BASE}/processing/start`, {
     method: "POST",

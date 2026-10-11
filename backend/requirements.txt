@@ -1,4 +1,26 @@
+# Core web app
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 python-multipart==0.0.9
 pydantic==2.9.2
+
+# Video / data
+opencv-python
+numpy
+scipy
+pillow
+matplotlib
+tqdm
+psutil
+requests
+
+# torch/torchvision/torchaudio are installed separately by setup.sh
+
+# Cutie's requirements
+hydra-core
+omegaconf
+einops
+
+# MobileSAM and Cutie themselves are installed by setup.sh:
+#   pip install -e vendor/MobileSAM --no-deps
+#   pip install -e vendor/Cutie --no-deps

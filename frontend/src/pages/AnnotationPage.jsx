@@ -6,6 +6,7 @@ import {
   submitAnnotation,
   testMask,
   fetchFrameAnnotations,
+  fetchSessionObjects,
   suggestFrames,
   deleteAnnotationObject,
 } from "../api.js";
@@ -34,24 +35,18 @@ import {
   ArrowLeft,
   ArrowRight,
   Add,
-  Save,
   View,
-  TrashCan,
   Undo,
   ChevronLeft,
   ChevronRight,
-  FlagFilled,
   CircleFilled,
   AddAlt,
   SubtractAlt,
   Keyboard,
-  Settings,
-  Play,
   Image,
   WarningAlt,
   Close,
   ZoomIn,
-  Cursor_1,
   TouchInteraction,
   Analytics,
   Checkmark,
@@ -63,9 +58,11 @@ export default function AnnotationPage() {
   const [currentIndex, setCurrentIndex] = useState(0);
   const [points, setPoints] = useState([]);
   const [objectName, setObjectName] = useState("");
-  const [objectList, setObjectList] = useState([]);
+  const [sessionObjects, setSessionObjects] = useState({});
+  const sessionObjectsRef = useRef({});
   const [selectedObject, setSelectedObject] = useState("");
   const [frameObjects, setFrameObjects] = useState({});
+  const [hydratedFrame, setHydratedFrame] = useState(null);
   const [savedCounts, setSavedCounts] = useState({});
   const [videoDims, setVideoDims] = useState(null);
   const [useThumbs, setUseThumbs] = useState(true);
@@ -73,8 +70,9 @@ export default function AnnotationPage() {
   const [status, setStatus] = useState("Load a session to begin annotating.");
   const [statusKind, setStatusKind] = useState("info");
   const [busy, setBusy] = useState(false);
-  const [maskPreviewUrl, setMaskPreviewUrl] = useState("");
-  const [showPreview, setShowPreview] = useState(false);
+  // Live mask preview
+  const [previewPolygons, setPreviewPolygons] = useState(null);
+  const [previewMeta, setPreviewMeta] = useState(null);
   const [markAsTarget, setMarkAsTarget] = useState(false);
   const [targetToggleTouched, setTargetToggleTouched] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -85,9 +83,9 @@ export default function AnnotationPage() {
   const [annotationMode, setAnnotationMode] = useState("point"); // "point" or "bbox"
   const [bboxDraw, setBboxDraw] = useState(null); // {startFx, startFy} while dragging
   const [objectBboxes, setObjectBboxes] = useState({}); // {objectName: {x1,y1,x2,y2,fx1,fy1,fx2,fy2}}
-  const [targetFlowStep, setTargetFlowStep] = useState("frame"); // "frame" | "prompt" | "bbox" | "points" | null
   const annotationsCache = useRef(new Map());
   const maskCache = useRef(new Map());
+  const previewRequestSeq = useRef(0);
   const imgRef = useRef(null);
   const objectInputRef = useRef(null);
   const navigate = useNavigate();
@@ -129,10 +127,6 @@ export default function AnnotationPage() {
           e.preventDefault();
           handleTestMask();
           break;
-        case "enter":
-          e.preventDefault();
-          handleSavePoints();
-          break;
         case "z":
           if (e.ctrlKey || e.metaKey) {
             e.preventDefault();
@@ -170,7 +164,34 @@ export default function AnnotationPage() {
     setUseThumbs(true);
     setMarkAsTarget(false);
     setTargetToggleTouched(false);
+    setSessionObjectsBoth({});
   }, [sessionId]);
+
+  // Keeps sessionObjects (state, for render) and sessionObjectsRef (for
+  // synchronous reads inside closures like hydrateFrame/handleDeleteObject,
+  // where waiting for a re-render would read stale data) in lockstep.
+  function setSessionObjectsBoth(next) {
+    sessionObjectsRef.current = next;
+    setSessionObjects(next);
+  }
+
+  async function refreshSessionObjects() {
+    if (!sessionId) return;
+    try {
+      const data = await fetchSessionObjects(sessionId);
+      setSessionObjectsBoth(data.objects || {});
+    } catch (err) {
+      // Non-fatal: the persistent object panel just keeps showing whatever
+      // it already had until the next successful refresh.
+    }
+  }
+
+  useEffect(() => {
+    refreshSessionObjects();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId]);
+
+  const objectList = Object.keys(sessionObjects);
 
   useEffect(() => {
     async function fetchFrames() {
@@ -211,20 +232,37 @@ export default function AnnotationPage() {
           return normalized;
         };
 
+        // Pick which object stays selected after a frame change. If the
+        // currently-selected object still exists anywhere in the session
+        // (globally, not just on this specific frame), keep it selected --
+        // this is what makes drift correction possible: select "pig" on
+        // frame 0, jump to frame 1000 where "pig" has no points yet, and
+        // it's still the selected object (with an empty point list) ready
+        // for new correction clicks, instead of the selection jumping to
+        // whatever happens to be first on frame 1000 or disappearing.
+        const pickSelection = (normalized) => {
+          const globalNames = Object.keys(sessionObjectsRef.current);
+          const keepSelected =
+            selectedObject &&
+            (Object.prototype.hasOwnProperty.call(normalized, selectedObject) ||
+              globalNames.includes(selectedObject));
+          return keepSelected ? selectedObject : Object.keys(normalized)[0] || globalNames[0] || "";
+        };
+
         const cached = annotationsCache.current.get(cacheKey);
         if (cached) {
           const normalized = normalizeObjects(cached);
           setFrameObjects(normalized);
-          setObjectList(Object.keys(normalized));
+          setHydratedFrame(currentIndex);
           const counts = {};
           Object.entries(normalized).forEach(([name, pts]) => {
             counts[name] = Array.isArray(pts) ? pts.length : 0;
           });
           setSavedCounts(counts);
-          const first = Object.keys(normalized)[0] || "";
-          setSelectedObject(first);
-          setPoints(first ? normalized[first] : []);
-          setMarkAsTarget(isTargetName(first));
+          const nextSelected = pickSelection(normalized);
+          setSelectedObject(nextSelected);
+          setPoints(nextSelected ? normalized[nextSelected] || [] : []);
+          setMarkAsTarget(isTargetName(nextSelected));
           setTargetToggleTouched(false);
           return;
         }
@@ -234,7 +272,7 @@ export default function AnnotationPage() {
         const normalized = normalizeObjects(objects);
         annotationsCache.current.set(cacheKey, normalized);
         setFrameObjects(normalized);
-        setObjectList(Object.keys(normalized));
+        setHydratedFrame(currentIndex);
         // Load bboxes if present
         const bboxes = data.bboxes || {};
         const loadedBboxes = {};
@@ -253,15 +291,11 @@ export default function AnnotationPage() {
           counts[name] = Array.isArray(pts) ? pts.length : 0;
         });
         setSavedCounts(counts);
-        const first = Object.keys(normalized)[0] || "";
-        setSelectedObject(first);
-        setPoints(first ? normalized[first] : []);
-        setMarkAsTarget(isTargetName(first));
+        const nextSelected = pickSelection(normalized);
+        setSelectedObject(nextSelected);
+        setPoints(nextSelected ? normalized[nextSelected] || [] : []);
+        setMarkAsTarget(isTargetName(nextSelected));
         setTargetToggleTouched(false);
-        // If objects exist, skip the target flow prompt
-        if (Object.keys(normalized).length > 0) {
-          setTargetFlowStep(null);
-        }
       } catch (err) {
         setStatus(err.message);
         setStatusKind("error");
@@ -270,21 +304,57 @@ export default function AnnotationPage() {
     hydrateFrame();
   }, [currentIndex, sessionId, videoDims]);
 
-  // Auto-advance: bbox drawn → switch to points step
+  // Keep the inline mask preview in sync with whichever object/frame is
+  // actually showing -- without this, switching frames or objects would
+  // leave a stale mask from the previous context overlaid on the new one.
+  // Re-deriving from `frameObjects[selectedObject]` (rather than only firing
+  // on selectedObject/currentIndex) also means a redundant call right after
+  // a click just hits generateMaskPreview's own signature cache instead of
+  // re-requesting anything.
+  //
+  // Skip while `hydratedFrame` doesn't match `currentIndex` yet: right after
+  // navigating to a different frame, this effect (and the auto-save one
+  // below) still see the PREVIOUS frame's `frameObjects` in their closure --
+  // `currentIndex` already updated, but hydrateFrame's own state update for
+  // the new frame hasn't landed. Without this guard we'd briefly preview the
+  // old frame's mask at the wrong coordinates. It corrects itself the moment
+  // hydrateFrame's update lands and re-triggers this effect with the frame's
+  // real (possibly empty) points.
   useEffect(() => {
-    if (targetFlowStep === "bbox" && selectedObject && objectBboxes[selectedObject]) {
-      setTargetFlowStep("points");
-      setAnnotationMode("point");
-      setLabelMode(1);
+    if (hydratedFrame !== currentIndex) return;
+    const currentPoints = frameObjects[selectedObject] || [];
+    if (currentPoints.length > 0) {
+      generateMaskPreview(selectedObject, currentPoints, { silent: true });
+    } else {
+      previewRequestSeq.current += 1;
+      setPreviewPolygons(null);
+      setPreviewMeta(null);
     }
-  }, [objectBboxes, targetFlowStep, selectedObject]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedObject, currentIndex, frameObjects, hydratedFrame]);
 
-  // Re-prompt if all objects deleted
+  // Auto-save: persist the current object's points to the backend as soon
+  // as they change (or the "mark as target" checkbox is toggled), instead
+  // of requiring a manual "Save" click. A bad click is undone instantly
+  // with Undo/click-to-remove, so there's no real risk in saving eagerly --
+  // same "make the workflow as smooth as possible" reasoning as the live
+  // mask preview above. There is no Save button; this is the only place
+  // points ever reach the backend.
+  //
+  // Skip while `hydratedFrame` doesn't match `currentIndex` yet -- same race
+  // as the mask-preview effect above, but with a much worse consequence:
+  // without this guard, navigating from a frame with points to one without
+  // any would fire this effect with the OLD frame's `frameObjects` and the
+  // NEW frame's `currentIndex` still in its closure, silently saving the old
+  // frame's points onto the new frame even though nothing was clicked there.
   useEffect(() => {
-    if (objectList.length === 0 && targetFlowStep === null && !loading) {
-      setTargetFlowStep("frame");
-    }
-  }, [objectList.length, loading]);
+    if (hydratedFrame !== currentIndex) return;
+    // No length guard here: autoSavePoints itself decides whether there's
+    // anything to do, including the zero-points case (clearing a
+    // previously-saved object after an Undo removes its last point).
+    autoSavePoints();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedObject, currentIndex, frameObjects, markAsTarget, targetToggleTouched, hydratedFrame]);
 
   function updateCache(frameIndex, updatedObjects) {
     if (!sessionId) return;
@@ -336,8 +406,8 @@ export default function AnnotationPage() {
     setFrameObjects(updated);
     setPoints(updatedPoints);
     updateCache(currentIndex, updated);
-    setShowPreview(false);
-    setMaskPreviewUrl("");
+    // The live-preview effect (keyed on frameObjects) picks this up and
+    // regenerates or clears the mask preview on its own.
   }
 
   async function handleDeleteObject(name) {
@@ -347,16 +417,30 @@ export default function AnnotationPage() {
       const updated = { ...frameObjects };
       delete updated[name];
       setFrameObjects(updated);
-      setObjectList(Object.keys(updated));
+      // The backend removes this object from EVERY frame's annotation file,
+      // not just the current one -- purge it from the whole client cache
+      // too, or navigating back to a previously-visited frame would
+      // resurrect it from stale cached data.
+      for (const [key, obj] of annotationsCache.current.entries()) {
+        if (Object.prototype.hasOwnProperty.call(obj, name)) {
+          const clone = { ...obj };
+          delete clone[name];
+          annotationsCache.current.set(key, clone);
+        }
+      }
+      const nextSessionObjects = { ...sessionObjectsRef.current };
+      delete nextSessionObjects[name];
+      setSessionObjectsBoth(nextSessionObjects);
       setSavedCounts((prev) => {
         const next = { ...prev };
         delete next[name];
         return next;
       });
       if (selectedObject === name) {
-        const remaining = Object.keys(updated);
-        setSelectedObject(remaining.length > 0 ? remaining[0] : null);
-        setPoints(remaining.length > 0 ? updated[remaining[0]] || [] : []);
+        const remainingGlobal = Object.keys(nextSessionObjects);
+        const nextSelected = remainingGlobal[0] || "";
+        setSelectedObject(nextSelected);
+        setPoints(nextSelected ? updated[nextSelected] || [] : []);
       }
       updateCache(currentIndex, updated);
       setStatus(`Deleted object "${name.replace("TARGET:", "")}"`);
@@ -376,8 +460,8 @@ export default function AnnotationPage() {
     setFrameObjects(updated);
     setPoints(updatedPoints);
     updateCache(currentIndex, updated);
-    setShowPreview(false);
-    setMaskPreviewUrl("");
+    // The live-preview effect (keyed on frameObjects/selectedObject/currentIndex)
+    // picks this change up on its own and regenerates or clears the preview.
   }
 
   function buildMaskSignature(pointsForObject) {
@@ -434,8 +518,6 @@ export default function AnnotationPage() {
       }));
     }
     setBboxDraw(null);
-    setShowPreview(false);
-    setMaskPreviewUrl("");
   }
 
   function handleImageClick(event) {
@@ -451,25 +533,28 @@ export default function AnnotationPage() {
     setFrameObjects(updated);
     setPoints(next);
     updateCache(currentIndex, updated);
-    setShowPreview(false);
-    setMaskPreviewUrl("");
+    // The live-preview effect (keyed on frameObjects/selectedObject/currentIndex)
+    // picks this up and regenerates the mask with the new point set -- no
+    // separate call needed here, and no manual "Test Mask" click required.
   }
 
-  async function handleSavePoints() {
-    if (!sessionId) {
-      setStatus("Missing session. Return to Config.");
-      setStatusKind("error");
-      return;
-    }
-    if (!selectedObject) {
-      setStatus("Select or create an object before saving.");
-      setStatusKind("warning");
-      return;
-    }
+  // Persists the current object's points for the current frame, including
+  // committing a pending "mark as target" rename. Runs automatically
+  // whenever points change or the target checkbox is toggled (see the
+  // effect above) -- there's no manual Save button, so this never needs to
+  // talk to the user except on a genuine failure.
+  async function autoSavePoints() {
+    if (!sessionId || !selectedObject) return;
     if (!frameObjects[selectedObject] || frameObjects[selectedObject].length === 0) {
-      setStatus("Add at least one point before saving.");
-      setStatusKind("warning");
-      return;
+      // An Undo/remove-click can bring an object back down to zero points
+      // on this frame. If it was previously synced to the backend, fall
+      // through and push the now-empty list so the clear actually takes
+      // effect there too -- otherwise Process would still pick up the
+      // stale point the user thought they'd removed. Nothing to do if it
+      // was never saved in the first place.
+      if (!(savedCounts[selectedObject] > 0)) {
+        return;
+      }
     }
     let objectNameToSave = selectedObject;
     let updatedObjects = frameObjects;
@@ -506,13 +591,10 @@ export default function AnnotationPage() {
       y,
       label,
     }));
-    if (pointsToSave.length === 0) {
-      setStatus("Add at least one point before saving.");
-      setStatusKind("warning");
+    if (pointsToSave.length === 0 && !(savedCounts[objectNameToSave] > 0 || savedCounts[selectedObject] > 0)) {
       return;
     }
     try {
-      setBusy(true);
       const payload = {
         session_id: sessionId,
         frame_index: currentIndex,
@@ -532,20 +614,20 @@ export default function AnnotationPage() {
       }));
       if (updatedObjects !== frameObjects) {
         setFrameObjects(updatedObjects);
-        setObjectList(Object.keys(updatedObjects));
         setSelectedObject(objectNameToSave);
         setPoints(updatedObjects[objectNameToSave] || []);
       }
       updateCache(currentIndex, updatedObjects);
       setMarkAsTarget(isTargetName(objectNameToSave));
       setTargetToggleTouched(false);
-      setStatus("Points saved successfully.");
-      setStatusKind("success");
+      // Refresh the session-wide object registry so the persistent panel
+      // picks up this frame as a new/updated seed for objectNameToSave (and
+      // drops previousObjectName on a target-toggle rename) -- the backend
+      // is authoritative here since save can rename/merge objects.
+      await refreshSessionObjects();
     } catch (err) {
-      setStatus(err.message);
+      setStatus(`Auto-save failed: ${err.message}`);
       setStatusKind("error");
-    } finally {
-      setBusy(false);
     }
   }
 
@@ -601,6 +683,60 @@ export default function AnnotationPage() {
     }
   }
 
+  // Core mask-preview call, shared by the live per-click preview and the
+  // manual "Test Mask" button. Takes the object name and point list
+  // explicitly rather than reading `selectedObject`/`frameObjects` back from
+  // state, so a call fired right after a click always uses that click's
+  // point, not a possibly-stale render.
+  async function generateMaskPreview(objectNameArg, pointsList, { silent = false } = {}) {
+    if (!sessionId || !objectNameArg || !pointsList || pointsList.length === 0) return;
+
+    const signature = buildMaskSignature(pointsList);
+    const cacheKey = `${sessionId}:${currentIndex}:${objectNameArg}:${signature}`;
+    const cached = maskCache.current.get(cacheKey);
+    if (cached) {
+      setPreviewPolygons(cached.polygons);
+      setPreviewMeta({ width: cached.width, height: cached.height });
+      if (!silent) {
+        setStatus("Loaded cached mask preview.");
+        setStatusKind("info");
+      }
+      return;
+    }
+
+    const requestId = ++previewRequestSeq.current;
+    if (!silent) {
+      setStatus("Generating mask preview...");
+      setStatusKind("info");
+    }
+    try {
+      const testPayload = {
+        session_id: sessionId,
+        frame_index: currentIndex,
+        object_name: objectNameArg,
+        points: pointsList.map(({ x, y, label }) => ({ x, y, label })),
+      };
+      const response = await testMask(testPayload);
+      if (requestId !== previewRequestSeq.current) return; // superseded by a newer click/undo
+      const cacheValue = { polygons: response.polygons || [], width: response.width, height: response.height };
+      maskCache.current.set(cacheKey, cacheValue);
+      setPreviewPolygons(cacheValue.polygons);
+      setPreviewMeta({ width: cacheValue.width, height: cacheValue.height });
+      if (!silent) {
+        setStatus(response.message || "Mask preview generated.");
+        setStatusKind("success");
+      }
+    } catch (err) {
+      if (requestId !== previewRequestSeq.current) return;
+      console.error("Mask preview error:", err);
+      // Errors surface even in silent/auto mode -- staying quiet about a
+      // genuine failure (as opposed to the routine "generating..." noise)
+      // would just leave the user wondering why nothing happened.
+      setStatus(`Mask preview failed: ${err.message}`);
+      setStatusKind("error");
+    }
+  }
+
   async function handleTestMask() {
     if (!sessionId) {
       setStatus("No session. Return to Config page to start a new session.");
@@ -617,58 +753,12 @@ export default function AnnotationPage() {
       setStatusKind("warning");
       return;
     }
-    const signature = buildMaskSignature(frameObjects[selectedObject]);
-    const cacheKey = `${sessionId}:${currentIndex}:${selectedObject}:${signature}`;
-    const cached = maskCache.current.get(cacheKey);
-    if (cached) {
-      setMaskPreviewUrl(`${API_BASE}${cached}?t=${Date.now()}`);
-      setShowPreview(true);
-      setStatus("Loaded cached mask preview.");
-      setStatusKind("info");
-      return;
-    }
+    setBusy(true);
     try {
-      setBusy(true);
-      setStatus("Generating mask preview...");
-      setStatusKind("info");
-      const testPayload = {
-        session_id: sessionId,
-        frame_index: currentIndex,
-        object_name: selectedObject,
-        points: (frameObjects[selectedObject] || []).map(({ x, y, label }) => ({ x, y, label })),
-      };
-      const testBbox = objectBboxes[selectedObject];
-      if (testBbox) {
-        testPayload.bbox = { x1: testBbox.x1, y1: testBbox.y1, x2: testBbox.x2, y2: testBbox.y2 };
-      }
-      const response = await testMask(testPayload);
-      setStatus(response.message || "Mask test complete.");
-      setStatusKind("success");
-      if (response.preview_url) {
-        maskCache.current.set(cacheKey, response.preview_url);
-        setMaskPreviewUrl(`${API_BASE}${response.preview_url}?t=${Date.now()}`);
-        setShowPreview(true);
-      }
-    } catch (err) {
-      console.error("Test mask error:", err);
-      setStatus(`Test mask failed: ${err.message}`);
-      setStatusKind("error");
+      await generateMaskPreview(selectedObject, frameObjects[selectedObject]);
     } finally {
       setBusy(false);
     }
-  }
-
-  function startTargetFlow() {
-    const targetName = "target_marker";
-    const updated = { ...frameObjects, [targetName]: [] };
-    setFrameObjects(updated);
-    setObjectList(Object.keys(updated));
-    setSelectedObject(targetName);
-    setPoints([]);
-    setMarkAsTarget(true);
-    setAnnotationMode("bbox");
-    setTargetFlowStep("bbox");
-    updateCache(currentIndex, updated);
   }
 
   function handleAddObject() {
@@ -678,9 +768,12 @@ export default function AnnotationPage() {
       setStatusKind("warning");
       return;
     }
-    if (frameObjects[name]) {
+    // Check the SESSION-wide registry, not just this frame's points -- an
+    // object seeded on another frame (e.g. frame 0) but not this one should
+    // be selected (with an empty point list here), not treated as new.
+    if (Object.prototype.hasOwnProperty.call(sessionObjectsRef.current, name) || frameObjects[name]) {
       setSelectedObject(name);
-      setPoints(frameObjects[name]);
+      setPoints(frameObjects[name] || []);
       setObjectName("");
       setMarkAsTarget(isTargetName(name));
       setTargetToggleTouched(false);
@@ -688,7 +781,7 @@ export default function AnnotationPage() {
     }
     const updated = { ...frameObjects, [name]: [] };
     setFrameObjects(updated);
-    setObjectList(Object.keys(updated));
+    setSessionObjectsBoth({ ...sessionObjectsRef.current, [name]: { frames: [], point_count: 0 } });
     setSavedCounts((prev) => ({ ...prev, [name]: 0 }));
     setSelectedObject(name);
     setPoints([]);
@@ -834,37 +927,15 @@ export default function AnnotationPage() {
                       <InlineLoading description="Loading session..." />
                     </div>
                   ) : frameUrl ? (
-                    <>
-                      <img
-                        ref={imgRef}
-                        src={frameUrl}
-                        alt="Frame"
-                        style={{ width: "100%", height: "auto", display: "block" }}
-                        onError={() => {
-                          if (useThumbs) setUseThumbs(false);
-                        }}
-                      />
-                      {!selectedObject && (
-                        <div
-                          style={{
-                            position: "absolute",
-                            inset: 0,
-                            backgroundColor: "rgba(0,0,0,0.7)",
-                            display: "flex",
-                            alignItems: "center",
-                            justifyContent: "center",
-                          }}
-                        >
-                          <Tile style={{ maxWidth: "280px", display: "flex", flexDirection: "column", alignItems: "center", textAlign: "center" }}>
-                            <Cursor_1 size={32} style={{ marginBottom: "0.5rem" }} />
-                            <p style={{ fontWeight: 600, marginBottom: "0.5rem" }}>Create an object first</p>
-                            <p style={{ fontSize: "0.875rem", color: "#525252" }}>
-                              Type a name in the Objects panel and click "Add Object"
-                            </p>
-                          </Tile>
-                        </div>
-                      )}
-                    </>
+                    <img
+                      ref={imgRef}
+                      src={frameUrl}
+                      alt="Frame"
+                      style={{ width: "100%", height: "auto", display: "block" }}
+                      onError={() => {
+                        if (useThumbs) setUseThumbs(false);
+                      }}
+                    />
                   ) : (
                     <div style={{ padding: "4rem", display: "flex", flexDirection: "column", alignItems: "center", textAlign: "center", color: "#8d8d8d" }}>
                       {!sessionId ? (
@@ -885,6 +956,31 @@ export default function AnnotationPage() {
                         </>
                       )}
                     </div>
+                  )}
+                  {/* Live mask preview: drawn inline over the frame, updated on
+                      every click -- no popup, nothing blocking the workflow. */}
+                  {previewPolygons && previewPolygons.length > 0 && previewMeta && (
+                    <svg
+                      viewBox={`0 0 ${previewMeta.width} ${previewMeta.height}`}
+                      preserveAspectRatio="none"
+                      style={{
+                        position: "absolute",
+                        inset: 0,
+                        width: "100%",
+                        height: "100%",
+                        pointerEvents: "none",
+                      }}
+                    >
+                      {previewPolygons.map((poly, i) => (
+                        <polygon
+                          key={i}
+                          points={poly.map(([x, y]) => `${x},${y}`).join(" ")}
+                          fill="rgba(66, 190, 101, 0.45)"
+                          stroke="rgba(66, 190, 101, 0.9)"
+                          strokeWidth={Math.max(1, previewMeta.width / 400)}
+                        />
+                      ))}
+                    </svg>
                   )}
                   {/* Point markers */}
                   {(frameObjects[selectedObject] || []).map((point) => (
@@ -984,177 +1080,6 @@ export default function AnnotationPage() {
             <Column lg={4} md={2} sm={4}>
               <div style={{ maxHeight: "calc(100vh - 120px)", overflowY: "auto", position: "sticky", top: "60px" }}>
 
-              {/* ── Guided flow: frame selection ── */}
-              {targetFlowStep === "frame" && (
-                <Tile style={{ marginBottom: "1rem" }}>
-                  <h3 style={{ fontSize: "1.125rem", fontWeight: 600, marginBottom: "0.75rem" }}>
-                    Step 1: Select Reference Frame
-                  </h3>
-                  <p style={{ fontSize: "0.875rem", color: "#525252", marginBottom: "1rem" }}>
-                    Navigate to a frame where your objects are clearly visible, or use suggested optimal frames.
-                  </p>
-                  <p style={{ fontSize: "0.875rem", fontWeight: 600, marginBottom: "1rem", textAlign: "center" }}>
-                    Frame {frames.length ? currentIndex + 1 : 0} / {frames.length}
-                  </p>
-                  <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
-                    {loadingSuggestions ? (
-                      <InlineLoading description="Analyzing frames..." />
-                    ) : (
-                      <Button
-                        kind="tertiary"
-                        size="sm"
-                        renderIcon={Analytics}
-                        onClick={handleSuggestFrames}
-                        disabled={frames.length === 0}
-                        style={{ width: "100%", justifyContent: "center" }}
-                      >
-                        {suggestedFrames.length > 0
-                          ? `View Suggested Frames (${suggestedFrames.length})`
-                          : "Suggest Optimal Frames"}
-                      </Button>
-                    )}
-                    <Button
-                      kind="primary"
-                      size="lg"
-                      onClick={() => setTargetFlowStep("prompt")}
-                      disabled={frames.length === 0}
-                      style={{ width: "100%", justifyContent: "center", maxWidth: "100%", paddingRight: "1rem" }}
-                    >
-                      Use This Frame
-                    </Button>
-                  </div>
-                </Tile>
-              )}
-
-              {/* ── Guided target flow: prompt ── */}
-              {targetFlowStep === "prompt" && (
-                <Tile style={{ marginBottom: "1rem" }}>
-                  <h3 style={{ fontSize: "1.125rem", fontWeight: 600, marginBottom: "1.25rem", textAlign: "center" }}>
-                    What would you like to do?
-                  </h3>
-                  <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
-                    <Button
-                      kind="primary"
-                      size="lg"
-                      onClick={startTargetFlow}
-                      style={{ width: "100%", justifyContent: "center", maxWidth: "100%", paddingRight: "1rem" }}
-                    >
-                      Add Target Marker
-                    </Button>
-                    <p style={{ fontSize: "0.75rem", color: "#525252", textAlign: "center", marginTop: "-0.5rem" }}>
-                      Draw a bounding box around your gaze ring, then refine with points
-                    </p>
-                    <Button
-                      kind="ghost"
-                      size="lg"
-                      onClick={() => setTargetFlowStep(null)}
-                      style={{ width: "100%", justifyContent: "center", maxWidth: "100%", paddingRight: "1rem" }}
-                    >
-                      Skip — Add Objects Only
-                    </Button>
-                    <p style={{ fontSize: "0.75rem", color: "#6f6f6f", textAlign: "center", marginTop: "-0.5rem" }}>
-                      Annotate objects without a target marker
-                    </p>
-                  </div>
-                </Tile>
-              )}
-
-              {/* ── Guided target flow: bbox step ── */}
-              {targetFlowStep === "bbox" && (
-                <Tile style={{ marginBottom: "1rem" }}>
-                  <h3 style={{ fontSize: "1rem", fontWeight: 600, marginBottom: "0.75rem", display: "flex", alignItems: "center", gap: "0.5rem" }}>
-                    <FlagFilled size={16} /> Step 1: Draw Bounding Box
-                  </h3>
-                  <p style={{ fontSize: "0.875rem", color: "#525252", marginBottom: "1rem" }}>
-                    Click and drag on the image to draw a box around the target marker.
-                  </p>
-                  <Tag type="cyan" size="sm">target_marker</Tag>
-                </Tile>
-              )}
-
-              {/* ── Guided target flow: points step ── */}
-              {targetFlowStep === "points" && (
-                <Tile style={{ marginBottom: "1rem" }}>
-                  <h3 style={{ fontSize: "1rem", fontWeight: 600, marginBottom: "0.75rem", display: "flex", alignItems: "center", gap: "0.5rem" }}>
-                    <FlagFilled size={16} /> Step 2: Add Points
-                  </h3>
-                  <p style={{ fontSize: "0.875rem", color: "#525252", marginBottom: "1rem" }}>
-                    Click inside the box to mark the target. Use negative points to exclude nearby objects.
-                  </p>
-                  <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.75rem" }}>
-                    <Button
-                      kind={labelMode === 1 ? "primary" : "secondary"}
-                      size="sm"
-                      onClick={() => setLabelMode(1)}
-                      renderIcon={AddAlt}
-                      style={{ flex: 1 }}
-                    >
-                      Positive
-                    </Button>
-                    <Button
-                      kind={labelMode === 0 ? "danger" : "secondary"}
-                      size="sm"
-                      onClick={() => setLabelMode(0)}
-                      renderIcon={SubtractAlt}
-                      style={{ flex: 1 }}
-                    >
-                      Negative
-                    </Button>
-                  </div>
-                  <div style={{ display: "flex", gap: "0.5rem" }}>
-                    <Button
-                      kind="ghost"
-                      size="sm"
-                      onClick={() => {
-                        const pts = frameObjects[selectedObject] || [];
-                        if (pts.length > 0) {
-                          undoLastPoint();
-                        } else {
-                          // Undo bbox → go back to bbox step
-                          setObjectBboxes((prev) => {
-                            const next = { ...prev };
-                            delete next[selectedObject];
-                            return next;
-                          });
-                          setTargetFlowStep("bbox");
-                          setAnnotationMode("bbox");
-                        }
-                      }}
-                      renderIcon={Undo}
-                      style={{ flex: 1 }}
-                    >
-                      Undo
-                    </Button>
-                    <Button
-                      kind="tertiary"
-                      size="sm"
-                      onClick={handleTestMask}
-                      disabled={busy}
-                      renderIcon={ZoomIn}
-                      style={{ flex: 1 }}
-                    >
-                      Test Mask
-                    </Button>
-                  </div>
-                  <Button
-                    kind="primary"
-                    size="sm"
-                    onClick={() => {
-                      handleSavePoints();
-                      setTargetFlowStep(null);
-                    }}
-                    disabled={busy || (frameObjects[selectedObject] || []).length === 0}
-                    renderIcon={Save}
-                    style={{ width: "100%", marginTop: "1rem", justifyContent: "center", maxWidth: "100%", paddingRight: "1rem" }}
-                  >
-                    Done — Save Target
-                  </Button>
-                </Tile>
-              )}
-
-              {/* ── Normal panel (after target flow or skip) ── */}
-              {targetFlowStep === null && (
-              <>
               {/* Objects panel */}
               <Tile style={{ marginBottom: "1rem" }}>
                 <h3 style={{ fontSize: "1rem", fontWeight: 600, marginBottom: "1rem", display: "flex", alignItems: "center", gap: "0.5rem" }}>
@@ -1185,12 +1110,9 @@ export default function AnnotationPage() {
                   }}
                   style={{ marginTop: "0.75rem" }}
                 />
-                <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.75rem" }}>
-                  <Button kind="secondary" size="sm" onClick={handleAddObject} renderIcon={Add}>
+                <div style={{ marginTop: "0.75rem" }}>
+                  <Button kind="secondary" size="sm" onClick={handleAddObject} renderIcon={Add} style={{ width: "100%" }}>
                     Add
-                  </Button>
-                  <Button size="sm" onClick={handleSavePoints} disabled={busy} renderIcon={Save}>
-                    Save
                   </Button>
                 </div>
 
@@ -1224,7 +1146,7 @@ export default function AnnotationPage() {
                               {isTargetName(name) && <Tag type="cyan" size="sm">Target</Tag>}
                             </span>
                             <div style={{ display: "flex", alignItems: "center", gap: "0.25rem" }}>
-                              <Tag type="gray" size="sm">{(frameObjects[name] || []).length} pts</Tag>
+                              <Tag type="gray" size="sm">{(frameObjects[name] || []).length} pts here</Tag>
                               <button
                                 onClick={(e) => {
                                   e.stopPropagation();
@@ -1248,6 +1170,36 @@ export default function AnnotationPage() {
                               </button>
                             </div>
                           </div>
+                          {/* Seed frames: jump between the frames this object
+                              already has points on, e.g. to compare frame 0's
+                              seed against drift spotted later at frame 1000
+                              and correct it right here. */}
+                          {(sessionObjects[name]?.frames?.length || 0) > 0 && (
+                            <div style={{ display: "flex", flexWrap: "wrap", gap: "0.25rem", marginTop: "0.5rem" }}>
+                              {sessionObjects[name].frames.map((f) => (
+                                <button
+                                  key={f}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setCurrentIndex(f);
+                                  }}
+                                  title={`Jump to frame ${f + 1}`}
+                                  style={{
+                                    fontSize: "0.7rem",
+                                    lineHeight: "1.4",
+                                    padding: "1px 6px",
+                                    borderRadius: "10px",
+                                    border: f === currentIndex ? "1px solid #0f62fe" : "1px solid #c6c6c6",
+                                    backgroundColor: f === currentIndex ? "#e5f6ff" : "#f4f4f4",
+                                    color: "#525252",
+                                    cursor: "pointer",
+                                  }}
+                                >
+                                  {f + 1}
+                                </button>
+                              ))}
+                            </div>
+                          )}
                         </div>
                       ))}
                     </div>
@@ -1346,7 +1298,6 @@ export default function AnnotationPage() {
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.25rem", fontSize: "0.75rem" }}>
                   <div><Tag type="gray" size="sm">C</Tag> Focus name</div>
                   <div><Tag type="gray" size="sm">T</Tag> Test mask</div>
-                  <div><Tag type="gray" size="sm">Enter</Tag> Save</div>
                   <div><Tag type="gray" size="sm">Ctrl+Z</Tag> Undo</div>
                   <div><Tag type="gray" size="sm">1</Tag> Positive</div>
                   <div><Tag type="gray" size="sm">2</Tag> Negative</div>
@@ -1380,30 +1331,11 @@ export default function AnnotationPage() {
                   </ul>
                 </InlineNotification>
               )}
-              </>
-              )}
               </div>
             </Column>
           </Grid>
         </div>
       </main>
-
-      {/* Mask preview modal */}
-      <Modal
-        open={showPreview}
-        onRequestClose={() => setShowPreview(false)}
-        modalHeading="Mask Preview"
-        passiveModal
-        size="lg"
-      >
-        <div style={{ backgroundColor: "#000", borderRadius: "4px", padding: "1rem", display: "flex", justifyContent: "center" }}>
-          {maskPreviewUrl ? (
-            <img src={maskPreviewUrl} alt="Mask preview" style={{ maxWidth: "100%", maxHeight: "60vh", objectFit: "contain" }} />
-          ) : (
-            <p style={{ color: "#6f6f6f" }}>No preview available</p>
-          )}
-        </div>
-      </Modal>
 
       {/* Frame suggestion modal */}
       <Modal

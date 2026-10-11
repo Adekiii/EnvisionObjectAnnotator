@@ -11,23 +11,20 @@ echo "========================================"
 echo ""
 
 # Check prerequisites
-echo "[1/6] Checking prerequisites..."
+echo "[1/5] Checking prerequisites..."
 
-# Python
 if ! command -v python3 &> /dev/null; then
     echo "ERROR: Python3 not found. Install Python 3.10+"
     exit 1
 fi
 echo "  Found: $(python3 --version)"
 
-# Node.js
 if ! command -v node &> /dev/null; then
     echo "ERROR: Node.js not found. Install Node.js 18+"
     exit 1
 fi
 echo "  Found: Node.js $(node --version)"
 
-# ffmpeg
 if ! command -v ffmpeg &> /dev/null; then
     echo "WARNING: ffmpeg not found. Video processing may fail."
     echo "  Install: brew install ffmpeg (Mac) or apt install ffmpeg (Linux)"
@@ -35,7 +32,6 @@ else
     echo "  Found: ffmpeg"
 fi
 
-# Git
 if ! command -v git &> /dev/null; then
     echo "ERROR: Git not found."
     exit 1
@@ -44,7 +40,7 @@ echo "  Found: git"
 
 # Create backend venv and install dependencies
 echo ""
-echo "[2/6] Setting up backend (Python venv + dependencies)..."
+echo "[2/5] Setting up backend (Python venv + dependencies)..."
 cd backend
 
 if [ ! -d ".venv" ]; then
@@ -60,15 +56,14 @@ PYTHON="./.venv/bin/python"
 echo "  Installing backend requirements..."
 $PIP install --upgrade pip -q
 $PIP install -r requirements.txt -q
-$PIP install numpy matplotlib tqdm opencv-python psutil -q
 
 # Install PyTorch
 echo "  Installing PyTorch..."
 if [[ "$(uname)" == "Darwin" ]]; then
-    # macOS - use default (MPS support)
+    # macOS - default build (includes Apple GPU / MPS support)
     $PIP install torch torchvision torchaudio -q
 else
-    # Linux - try CUDA first
+    # Linux - try CUDA first, fall back to CPU-only build
     $PIP install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 -q 2>/dev/null || \
     $PIP install torch torchvision torchaudio -q
 fi
@@ -95,69 +90,53 @@ else
     echo ""
 fi
 
-cd ..
-echo "  Backend setup complete"
+echo "  Backend Python setup complete"
 
-# Install SAM2
+# Vendor + install MobileSAM and Cutie
 echo ""
-echo "[3/6] Installing SAM2..."
-if [ ! -d "sam2" ]; then
-    git clone https://github.com/facebookresearch/sam2.git -q
+echo "[3/5] Installing MobileSAM (click -> mask) and Cutie (mask -> track)..."
+mkdir -p vendor
+
+if [ ! -d "vendor/MobileSAM" ]; then
+    echo "  Cloning MobileSAM..."
+    git clone --depth 1 https://github.com/ChaoningZhang/MobileSAM.git vendor/MobileSAM -q
+else
+    echo "  vendor/MobileSAM already exists"
 fi
-cd sam2
-../backend/.venv/bin/pip install -e . -q
-cd ..
-echo "  SAM2 installed"
+$PIP install -e vendor/MobileSAM --no-deps -q
 
-# Install EdgeTAM
-echo ""
-echo "[4/6] Installing EdgeTAM..."
-if [ ! -d "EdgeTAM" ]; then
-    git clone https://github.com/facebookresearch/EdgeTAM.git -q
+if [ ! -d "vendor/Cutie" ]; then
+    echo "  Cloning Cutie..."
+    git clone --depth 1 https://github.com/hkchengrex/Cutie.git vendor/Cutie -q
+else
+    echo "  vendor/Cutie already exists"
 fi
-cd EdgeTAM
-../backend/.venv/bin/pip install -e . -q
-../backend/.venv/bin/pip install timm -q
-cd ..
-echo "  EdgeTAM installed"
+$PIP install -e vendor/Cutie --no-deps -q
 
-# Download checkpoints
+echo "  MobileSAM and Cutie installed"
+
+# Checkpoints
 echo ""
-echo "[5/6] Downloading model checkpoints..."
-
+echo "[4/5] Setting up model checkpoints..."
 mkdir -p checkpoints
 
-SAM2_BASE="https://dl.fbaipublicfiles.com/segment_anything_2/092824"
-CHECKPOINTS=(
-    "sam2.1_hiera_tiny.pt"
-    "sam2.1_hiera_small.pt"
-    "sam2.1_hiera_base_plus.pt"
-    "sam2.1_hiera_large.pt"
-)
-
-for ckpt in "${CHECKPOINTS[@]}"; do
-    if [ ! -f "checkpoints/$ckpt" ]; then
-        echo "  Downloading $ckpt..."
-        curl -sL "$SAM2_BASE/$ckpt" -o "checkpoints/$ckpt"
+if [ ! -f "checkpoints/mobile_sam.pt" ]; then
+    if [ -f "vendor/MobileSAM/weights/mobile_sam.pt" ]; then
+        cp vendor/MobileSAM/weights/mobile_sam.pt checkpoints/mobile_sam.pt
+        echo "  mobile_sam.pt copied from the vendored MobileSAM repo"
     else
-        echo "  $ckpt already exists"
+        echo "  WARNING: vendor/MobileSAM/weights/mobile_sam.pt not found -- MobileSAM checkpoint is missing."
     fi
-done
-
-# EdgeTAM checkpoint
-mkdir -p EdgeTAM/checkpoints
-if [ ! -f "EdgeTAM/checkpoints/edgetam.pt" ]; then
-    echo "  Downloading edgetam.pt..."
-    curl -sL "https://huggingface.co/Arnav0400/EdgeTAM/resolve/main/edgetam.pt" -o "EdgeTAM/checkpoints/edgetam.pt"
 else
-    echo "  edgetam.pt already exists"
+    echo "  mobile_sam.pt already exists"
 fi
+echo "  (Cutie's own checkpoint, ~140MB, downloads automatically the first time you process a video)"
 
-echo "  Checkpoints downloaded"
+cd ..
 
 # Install frontend
 echo ""
-echo "[6/6] Setting up frontend (Node.js)..."
+echo "[5/5] Setting up frontend (Node.js)..."
 cd frontend
 npm install --silent 2>/dev/null
 cd ..
