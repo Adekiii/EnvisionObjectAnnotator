@@ -17,13 +17,15 @@ See the quantitative analysis PDF [here](Envision_report__mobilesam_cutie_.pdf).
 
 <p align="center">
   <b>Real-time click-to-mask with MobileSAM</b><br>
-  <video src="extra/workflow%20-%20click%20to%20mask%20in%20realtime.mp4" controls width="720"></video>
+  <img src="extra/workflow_click_to_mask.gif"></img>
 </p>
 
 <p align="center">
   <b>Result of Cutie propagation</b><br>
-  <video src="extra/cutie%20propagation.mp4" controls width="720"></video>
+  <img src="extra/cutie_propagation.gif"></img>
 </p>
+
+Note that the target marker is not annotated in the video, which likely would have made it harder (hence the idea of being able to supply the raw .csv gaze data rather than tracking the gaze circle).
 
 ## Setup
 
